@@ -148,18 +148,72 @@ registry.register(
 
 **工具调用代理** (`_make_tool_handler`)：
 ```python
-def _handler(args: dict, **kwargs) -> str:
-    async def _call():
-        result = await server.session.call_tool(tool_name, arguments=args)
-        # 处理 isError、content blocks、structuredContent
-        ...
-    return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+    """Return a sync handler that calls an MCP tool via the background loop."""
+    def _handler(args: dict, **kwargs) -> str:
+        with _lock:
+            server = _servers.get(server_name)
+        if not server or not server.session:
+            return json.dumps({
+                "error": f"MCP server '{server_name}' is not connected"
+            }, ensure_ascii=False)
+
+        async def _call():
+            result = await server.session.call_tool(tool_name, arguments=args)
+            # MCP CallToolResult has .content (list of content blocks) and .isError
+            if result.isError:
+                error_text = ""
+                for block in (result.content or []):
+                    if hasattr(block, "text"):
+                        error_text += block.text
+                return json.dumps({
+                    "error": _sanitize_error(
+                        error_text or "MCP tool returned an error"
+                    )
+                }, ensure_ascii=False)
+
+            # Collect text from content blocks
+            parts: List[str] = []
+            for block in (result.content or []):
+                if hasattr(block, "text"):
+                    parts.append(block.text)
+            text_result = "\n".join(parts) if parts else ""
+
+            # Combine content + structuredContent when both are present.
+            structured = getattr(result, "structuredContent", None)
+            if structured is not None:
+                if text_result:
+                    return json.dumps({
+                        "result": text_result,
+                        "structuredContent": structured,
+                    }, ensure_ascii=False)
+                return json.dumps({"result": structured}, ensure_ascii=False)
+            return json.dumps({"result": text_result}, ensure_ascii=False)
+
+        try:
+            return _run_on_mcp_loop(_call(), timeout=tool_timeout)
+        except InterruptedError:
+            return _interrupted_call_result()
+        except Exception as exc:
+            logger.error(
+                "MCP tool %s/%s call failed: %s",
+                server_name, tool_name, exc,
+            )
+            return json.dumps({
+                "error": _sanitize_error(
+                    f"MCP call failed: {type(exc).__name__}: {exc}"
+                )
+            }, ensure_ascii=False)
+
+    return _handler
 ```
 
 关键设计：
 - 同步 handler 通过 `run_coroutine_threadsafe()` 将异步调用桥接到 MCP 事件循环
 - 支持用户中断：检查 `is_interrupted()`
 - 错误清洗：`_sanitize_error()` 使用正则剔除凭据信息
+- 内容块处理：完整支持 MCP 的多内容块格式，包括文本和结构化内容
+- 兼容性：通过 `hasattr` 检查适配不同版本的 MCP SDK，确保向后兼容
 
 **选择性工具加载**：
 ```yaml
@@ -193,28 +247,202 @@ backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)  # 最大 60 秒
 ```
 
 **动态工具发现**：
+
+MCP 客户端支持通过服务器通知动态更新工具列表，核心实现如下：
 ```python
-case ToolListChangedNotification():
-    logger.info("MCP server '%s': received tools/list_changed notification", self.name)
-    await self._refresh_tools()
+def _make_message_handler(self):
+    """Build a ``message_handler`` callback for ``ClientSession``."""
+    async def _handler(message):
+        try:
+            if isinstance(message, Exception):
+                logger.debug("MCP message handler (%s): exception: %s", self.name, message)
+                return
+            if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
+                match message.root:
+                    case ToolListChangedNotification():
+                        logger.info(
+                            "MCP server '%s': received tools/list_changed notification",
+                            self.name,
+                        )
+                        await self._refresh_tools()
+                    case PromptListChangedNotification():
+                        logger.debug("MCP server '%s': prompts/list_changed (ignored)", self.name)
+                    case ResourceListChangedNotification():
+                        logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
+                    case _:
+                        pass
+        except Exception:
+            logger.exception("Error in MCP message handler for '%s'", self.name)
+    return _handler
 ```
 
-当 MCP 服务器发送 `notifications/tools/list_changed` 通知时，自动重新获取工具列表，注销旧工具、注册新工具，并记录变更差异。使用 `asyncio.Lock` 防止并发刷新。
+**工具刷新实现**：
+```python
+async def _refresh_tools(self):
+    """Re-fetch tools from the server and update the registry."""
+    from tools.registry import registry
+
+    async with self._refresh_lock:
+        # Capture old tool names for change diff
+        old_tool_names = set(self._registered_tool_names)
+
+        # 1. Fetch current tool list from server
+        tools_result = await self.session.list_tools()
+        new_mcp_tools = tools_result.tools if hasattr(tools_result, "tools") else []
+
+        # 2. Deregister old tools from the central registry
+        for prefixed_name in self._registered_tool_names:
+            registry.deregister(prefixed_name)
+
+        # 3. Re-register with fresh tool list
+        self._tools = new_mcp_tools
+        self._registered_tool_names = _register_server_tools(
+            self.name, self, self._config
+        )
+
+        # 5. Log what changed (user-visible notification)
+        new_tool_names = set(self._registered_tool_names)
+        added = new_tool_names - old_tool_names
+        removed = old_tool_names - new_tool_names
+        changes = []
+        if added:
+            changes.append(f"added: {', '.join(sorted(added))}")
+        if removed:
+            changes.append(f"removed: {', '.join(sorted(removed))}")
+        if changes:
+            logger.warning(
+                "MCP server '%s': tools changed dynamically — %s. "
+                "Verify these changes are expected.",
+                self.name, "; ".join(changes),
+            )
+```
+
+设计亮点：
+- 使用 `asyncio.Lock` 防止并发刷新导致的竞争条件
+- 原子性操作：工具列表的注销和重新注册在事件循环的单步中完成
+- 变更审计：记录工具的新增和移除，提示用户验证变更
+- 兼容性：通过 `hasattr` 检查适配不同版本的 MCP SDK
 
 **子进程管理**：
 通过 `_snapshot_child_pids()` 跟踪 stdio 子进程 PID，在事件循环关闭后强制杀死未正常退出的孤儿进程。
 
 ### 2.6 Sampling 支持
 
-`SamplingHandler` 实现了 MCP 的 `sampling/createMessage` 能力，允许 MCP 服务器请求 LLM 补全：
+`SamplingHandler` 实现了 MCP 的 `sampling/createMessage` 能力，允许 MCP 服务器反向请求 LLM 补全，这是 MCP 协议中最强大的特性之一：
 
+```python
+class SamplingHandler:
+    """Handles sampling/createMessage requests for a single MCP server.
+    
+    Each MCPServerTask that has sampling enabled creates one SamplingHandler.
+    The handler is callable and passed directly to ``ClientSession`` as
+    the ``sampling_callback``.
+    """
+    _STOP_REASON_MAP = {"stop": "endTurn", "length": "maxTokens", "tool_calls": "toolUse"}
+    
+    def __init__(self, server_name: str, config: dict):
+        self.server_name = server_name
+        self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
+        self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
+        self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
+        self.max_tool_rounds = _safe_numeric(
+            config.get("max_tool_rounds", 5), 5, int, minimum=0,
+        )
+        self.model_override = config.get("model")
+        self.allowed_models = config.get("allowed_models", [])
+        # Per-instance state
+        self._rate_timestamps: List[float] = []
+        self._tool_loop_count = 0
+        self.metrics = {"requests": 0, "errors": 0, "tokens_used": 0, "tool_use_count": 0}
+```
+
+**核心方法实现**：
+```python
+# -- Rate limiting -------------------------------------------------------
+def _check_rate_limit(self) -> bool:
+    """Sliding-window rate limiter. Returns True if request is allowed."""
+    now = time.time()
+    window = now - 60
+    self._rate_timestamps[:] = [t for t in self._rate_timestamps if t > window]
+    if len(self._rate_timestamps) >= self.max_rpm:
+        return False
+    self._rate_timestamps.append(now)
+    return True
+
+# -- Message conversion --------------------------------------------------
+def _convert_messages(self, params) -> List[dict]:
+    """Convert MCP SamplingMessages to OpenAI format."""
+    messages: List[dict] = []
+    for msg in params.messages:
+        blocks = msg.content_as_list if hasattr(msg, "content_as_list") else (
+            msg.content if isinstance(msg.content, list) else [msg.content]
+        )
+        
+        # Separate blocks by kind
+        tool_results = [b for b in blocks if hasattr(b, "toolUseId")]
+        tool_uses = [b for b in blocks if hasattr(b, "name") and hasattr(b, "input") and not hasattr(b, "toolUseId")]
+        content_blocks = [b for b in blocks if not hasattr(b, "toolUseId") and not (hasattr(b, "name") and hasattr(b, "input"))]
+        
+        # Emit tool result messages (role: tool)
+        for tr in tool_results:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tr.toolUseId,
+                "content": self._extract_tool_result_text(tr),
+            })
+        
+        # Emit assistant tool_calls message
+        if tool_uses:
+            tc_list = []
+            for tu in tool_uses:
+                tc_list.append({
+                    "id": getattr(tu, "id", f"call_{len(tc_list)}"),
+                    "type": "function",
+                    "function": {
+                        "name": tu.name,
+                        "arguments": json.dumps(tu.input, ensure_ascii=False) if isinstance(tu.input, dict) else str(tu.input),
+                    },
+                })
+            msg_dict: dict = {"role": msg.role, "tool_calls": tc_list}
+            # Include any accompanying text
+            text_parts = [b.text for b in content_blocks if hasattr(b, "text")]
+            if text_parts:
+                msg_dict["content"] = "\n".join(text_parts)
+            messages.append(msg_dict)
+        elif content_blocks:
+            # Pure text/image content
+            if len(content_blocks) == 1 and hasattr(content_blocks[0], "text"):
+                messages.append({"role": msg.role, "content": content_blocks[0].text})
+            else:
+                parts = []
+                for block in content_blocks:
+                    if hasattr(block, "text"):
+                        parts.append({"type": "text", "text": block.text})
+                    elif hasattr(block, "data") and hasattr(block, "mimeType"):
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                        })
+                if parts:
+                    messages.append({"role": msg.role, "content": parts})
+    
+    return messages
+```
+
+**调用流程**：
 ```python
 async def __call__(self, context, params):
     if not self._check_rate_limit():     # 滑动窗口限流
-        return self._error(...)
-    model = self._resolve_model(...)      # 模型解析
+        return self._error("Rate limit exceeded", code=429)
+    model = self._resolve_model(params.model_preferences)  # 模型解析
+    if model and self.allowed_models and model not in self.allowed_models:
+        return self._error(f"Model {model} is not allowed", code=403)
+    
     messages = self._convert_messages(params)  # MCP → OpenAI 格式转换
-    response = await asyncio.to_thread(_sync_call)  # 异步化同步 LLM 调用
+    # Asyncify sync LLM call to avoid blocking event loop
+    response = await asyncio.to_thread(_sync_call, messages, model, self.max_tokens_cap)
+    # Convert response back to MCP format
+    return self._build_sampling_response(response)
 ```
 
 安全控制：
@@ -223,6 +451,7 @@ async def __call__(self, context, params):
 - token 上限（`max_tokens_cap`，默认 4096）
 - 工具循环治理（`max_tool_rounds`，默认 5 轮）
 - 超时控制（`timeout`，默认 30 秒）
+- 审计日志：记录所有采样请求和结果，便于安全审计
 
 ### 2.7 安全机制
 
@@ -277,22 +506,121 @@ _MCP_INJECTION_PATTERNS = [
 
 ### 3.2 EventBridge 事件桥
 
-`EventBridge` 是核心组件，用后台线程轮询 SQLite 数据库：
+`EventBridge` 是 MCP 服务器的核心组件，负责将 Hermes 的内部事件暴露给 MCP 客户端：
 
 ```python
-def _poll_loop(self):
-    db = _get_session_db()
-    while self._running:
-        self._poll_once(db)
-        time.sleep(POLL_INTERVAL)  # 200ms
+class EventBridge:
+    """Background poller that watches SessionDB for new messages and
+    maintains an in-memory event queue with waiter support.
+    
+    This is the Hermes equivalent of OpenClaw's WebSocket gateway bridge.
+    Instead of WebSocket events, we poll the SQLite database for changes.
+    """
+    def __init__(self):
+        self._queue: List[QueueEvent] = []
+        self._cursor = 0
+        self._lock = threading.Lock()
+        self._new_event = threading.Event()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
+        # In-memory approval tracking (populated from events)
+        self._pending_approvals: Dict[str, dict] = {}
+        # mtime cache — skip expensive work when files haven't changed
+        self._sessions_json_mtime: float = 0.0
+        self._state_db_mtime: float = 0.0
+        self._cached_sessions_index: dict = {}
 ```
 
-**mtime 优化**：通过检查 `sessions.json` 和 `state.db` 的文件修改时间，跳过无变化时的昂贵操作，使 200ms 轮询几乎零开销。
+**核心轮询逻辑**：
+```python
+def _poll_loop(self):
+    """Background loop: poll SessionDB for new messages."""
+    db = _get_session_db()
+    if not db:
+        logger.warning("EventBridge: SessionDB unavailable, event polling disabled")
+        return
+    
+    while self._running:
+        try:
+            self._poll_once(db)
+        except Exception as e:
+            logger.debug("EventBridge poll error: %s", e)
+        time.sleep(POLL_INTERVAL)  # 200ms
 
-**事件队列**：
-- 容量限制：`QUEUE_LIMIT = 1000`
-- 线程安全：使用 `threading.Lock` 保护
-- 唤醒机制：`threading.Event` 用于 `wait_for_event()` 的阻塞等待
+def _poll_once(self, db):
+    """Check for new messages across all sessions.
+    
+    Uses mtime checks on sessions.json and state.db to skip work
+    when nothing has changed — makes 200ms polling essentially free.
+    """
+    # Check if sessions.json has changed (mtime check is ~1μs)
+    sessions_file = _get_sessions_dir() / "sessions.json"
+```
+
+**事件查询接口**：
+```python
+def poll_events(
+    self,
+    after_cursor: int = 0,
+    session_key: Optional[str] = None,
+    limit: int = 20,
+) -> dict:
+    """Return events since after_cursor, optionally filtered by session_key."""
+    with self._lock:
+        events = [
+            e for e in self._queue
+            if e.cursor > after_cursor
+            and (not session_key or e.session_key == session_key)
+        ][:limit]
+    
+    next_cursor = events[-1].cursor if events else after_cursor
+    return {
+        "events": [
+            {"cursor": e.cursor, "type": e.type,
+             "session_key": e.session_key, **e.data}
+            for e in events
+        ],
+        "next_cursor": next_cursor,
+    }
+
+def wait_for_event(
+    self,
+    after_cursor: int = 0,
+    session_key: Optional[str] = None,
+    timeout_ms: int = 30000,
+) -> Optional[dict]:
+    """Block until a matching event arrives or timeout expires."""
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    
+    while time.monotonic() < deadline:
+        with self._lock:
+            for e in self._queue:
+                if e.cursor > after_cursor and (
+                    not session_key or e.session_key == session_key
+                ):
+                    return {
+                        "cursor": e.cursor, "type": e.type,
+                        "session_key": e.session_key, **e.data,
+                    }
+        
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        self._new_event.clear()
+        self._new_event.wait(timeout=min(remaining, POLL_INTERVAL))
+    
+    return None
+```
+
+**设计亮点**：
+- **mtime 优化**：通过检查 `sessions.json` 和 `state.db` 的文件修改时间，跳过无变化时的昂贵操作，使 200ms 轮询几乎零开销
+- **双接口设计**：提供轮询（`poll_events`）和长等待（`wait_for_event`）两种查询模式，适配不同客户端需求
+- **事件队列**：
+  - 容量限制：`QUEUE_LIMIT = 1000`，防止内存溢出
+  - 线程安全：使用 `threading.Lock` 保护所有队列操作
+  - 唤醒机制：`threading.Event` 用于 `wait_for_event()` 的阻塞等待，减少 CPU 占用
+- **光标机制**：使用递增光标确保事件消费的可靠性，避免重复或丢失事件
 
 ### 3.3 数据提取
 
@@ -318,21 +646,117 @@ ACP (Agent Client Protocol) 是一个面向编辑器集成的协议，允许 IDE
 
 `HermesACPAgent` 继承 `acp.Agent`，实现完整的 ACP 协议：
 
+**类定义**：
+```python
+class HermesACPAgent(acp.Agent):
+    """ACP Agent implementation wrapping Hermes AIAgent."""
+    _SLASH_COMMANDS = {
+        "help": "Show available commands",
+        "model": "Show or change current model",
+        "tools": "List available tools",
+        "context": "Show conversation context info",
+        "reset": "Clear conversation history",
+        "compact": "Compress conversation context",
+        "version": "Show Hermes version",
+    }
+    
+    def __init__(self, session_manager: SessionManager | None = None):
+        super().__init__()
+        self.session_manager = session_manager or SessionManager()
+        self._conn: Optional[acp.Client] = None
+```
+
 **初始化** (`initialize`)：
 ```python
-return InitializeResponse(
-    protocol_version=acp.PROTOCOL_VERSION,
-    agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
-    agent_capabilities=AgentCapabilities(
-        load_session=True,
-        session_capabilities=SessionCapabilities(
-            fork=SessionForkCapabilities(),
-            list=SessionListCapabilities(),
-            resume=SessionResumeCapabilities(),
+async def initialize(
+    self,
+    protocol_version: int | None = None,
+    client_capabilities: ClientCapabilities | None = None,
+    client_info: Implementation | None = None,
+    **kwargs: Any,
+) -> InitializeResponse:
+    resolved_protocol_version = (
+        protocol_version if isinstance(protocol_version, int) else acp.PROTOCOL_VERSION
+    )
+    provider = detect_provider()
+    auth_methods = None
+    if provider:
+        auth_methods = [
+            AuthMethodAgent(
+                id=provider,
+                name=f"{provider} runtime credentials",
+                description=f"Authenticate Hermes using the currently configured {provider} runtime credentials.",
+            )
+        ]
+    
+    return InitializeResponse(
+        protocol_version=acp.PROTOCOL_VERSION,
+        agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
+        agent_capabilities=AgentCapabilities(
+            load_session=True,
+            session_capabilities=SessionCapabilities(
+                fork=SessionForkCapabilities(),
+                list=SessionListCapabilities(),
+                resume=SessionResumeCapabilities(),
+            ),
         ),
-    ),
-    auth_methods=auth_methods,  # 检测到的运行时凭据
-)
+        auth_methods=auth_methods,  # 检测到的运行时凭据
+    )
+```
+
+**MCP 服务器动态注册**：
+```python
+async def _register_session_mcp_servers(
+    self,
+    state: SessionState,
+    mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
+) -> None:
+    """Register ACP-provided MCP servers and refresh the agent tool surface."""
+    if not mcp_servers:
+        return
+    
+    try:
+        from tools.mcp_tool import register_mcp_servers
+        config_map: dict[str, dict] = {}
+        for server in mcp_servers:
+            name = server.name
+            if isinstance(server, McpServerStdio):
+                config = {
+                    "command": server.command,
+                    "args": list(server.args),
+                    "env": {item.name: item.value for item in server.env},
+                }
+            else:
+                config = {
+                    "url": server.url,
+                    "headers": {item.name: item.value for item in server.headers},
+                }
+            config_map[name] = config
+        
+        await asyncio.to_thread(register_mcp_servers, config_map)
+    except Exception:
+        logger.warning(
+            "Session %s: failed to register ACP MCP servers",
+            state.session_id,
+            exc_info=True,
+        )
+        return
+    
+    # Refresh agent tool surface
+    from model_tools import get_tool_definitions
+    enabled_toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+    disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
+    state.agent.tools = get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=True,
+    )
+    state.agent.valid_tool_names = {
+        tool["function"]["name"] for tool in state.agent.tools or []
+    }
+    invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+    if callable(invalidate):
+        invalidate()
 ```
 
 **Prompt 核心流程** (`prompt`)：
@@ -395,6 +819,74 @@ def get_session(self, session_id):
 | `make_step_cb` | 步骤完成 | `ToolCallProgress` (completed) |
 | `make_message_cb` | 消息文本 | `update_agent_message_text` |
 
+**工具进度回调实现**：
+```python
+def make_tool_progress_cb(
+    conn: acp.Client,
+    session_id: str,
+    loop: asyncio.AbstractEventLoop,
+    tool_call_ids: Dict[str, Deque[str]],
+) -> Callable:
+    """Create a ``tool_progress_callback`` for AIAgent."""
+    def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        # Only emit ACP ToolCallStart for tool.started; ignore other event types
+        if event_type != "tool.started":
+            return
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {"raw": args}
+        if not isinstance(args, dict):
+            args = {}
+        
+        tc_id = make_tool_call_id()
+        queue = tool_call_ids.get(name)
+        if queue is None:
+            queue = deque()
+            tool_call_ids[name] = queue
+        queue.append(tc_id)
+        
+        update = build_tool_start(tc_id, name, args)
+        _send_update(conn, session_id, loop, update)
+    
+    return _tool_progress
+```
+
+**步骤回调实现**：
+```python
+def make_step_cb(
+    conn: acp.Client,
+    session_id: str,
+    loop: asyncio.AbstractEventLoop,
+    tool_call_ids: Dict[str, Deque[str]],
+) -> Callable:
+    """Create a ``step_callback`` for AIAgent."""
+    def _step(api_call_count: int, prev_tools: Any = None) -> None:
+        if prev_tools and isinstance(prev_tools, list):
+            for tool_info in prev_tools:
+                tool_name = None
+                result = None
+                
+                if isinstance(tool_info, dict):
+                    tool_name = tool_info.get("name") or tool_info.get("function_name")
+                    result = tool_info.get("result") or tool_info.get("output")
+                elif isinstance(tool_info, str):
+                    tool_name = tool_info
+                
+                queue = tool_call_ids.get(tool_name or "")
+                if tool_name and queue:
+                    tc_id = queue.popleft()
+                    update = build_tool_complete(
+                        tc_id, tool_name, result=str(result) if result is not None else None
+                    )
+                    _send_update(conn, session_id, loop, update)
+                    if not queue:
+                        tool_call_ids.pop(tool_name, None)
+    
+    return _step
+```
+
 **线程桥接模式**：
 ```python
 def _send_update(conn, session_id, loop, update):
@@ -404,7 +896,7 @@ def _send_update(conn, session_id, loop, update):
     future.result(timeout=5)  # 最多等 5 秒
 ```
 
-**工具调用 ID 管理**：使用 FIFO 队列 (`Deque[str]`) 跟踪同名并行工具调用的 ID，确保 `tool.started` 和 `tool.completed` 正确配对。
+**工具调用 ID 管理**：使用 FIFO 队列 (`Deque[str]`) 跟踪同名并行工具调用的 ID，确保 `tool.started` 和 `tool.completed` 正确配对。这种设计即使在多个同名工具并行调用的情况下也能正确匹配开始和完成事件，避免 UI 显示混乱。
 
 ### 4.5 权限与认证
 
@@ -797,19 +1289,36 @@ while True:
 ## 八、学习路径建议
 
 ### 初级（理解基础）
-1. 阅读 JSON-RPC 2.0 规范
-2. 理解 asyncio 的事件循环、Task、Future 概念
-3. 学习 Python 的 `threading` 与 `asyncio` 交互方式
-4. 阅读 MCP 官方文档 (modelcontextprotocol.io)
+1. 阅读 JSON-RPC 2.0 规范，理解请求、响应、通知的格式和语义
+2. 理解 asyncio 的事件循环、Task、Future 概念，掌握异步编程基础
+3. 学习 Python 的 `threading` 与 `asyncio` 交互方式，理解 `run_coroutine_threadsafe()` 的工作原理
+4. 阅读 MCP 官方文档 (modelcontextprotocol.io)，了解 MCP 协议的核心概念和能力分层
 
 ### 中级（深入实现）
-1. 研读 `tools/mcp_tool.py` 的 `MCPServerTask` 生命周期管理
-2. 理解 `run_coroutine_threadsafe()` 的使用场景和陷阱
+1. 研读 `tools/mcp_tool.py` 的 `MCPServerTask` 生命周期管理，理解单 Task 设计的必要性
+2. 理解 `_run_on_mcp_loop()` 的实现，掌握同步到异步桥接的设计模式和中断处理机制
 3. 学习 anyio cancel-scope 的工作原理（为什么必须在同一 Task 中 enter/exit）
-4. 阅读 `acp_adapter/server.py` 理解协议适配的完整流程
+4. 阅读 `acp_adapter/server.py` 理解协议适配的完整流程，掌握适配器模式的实际应用
+5. 分析 `EventBridge` 的轮询设计，理解基于 mtime 优化的低开销轮询实现
 
 ### 高级（架构设计）
-1. 研究 MCP 的 Sampling 协议及其安全模型
-2. 理解 StreamableHTTP 传输的 SSE + POST 双向通信机制
-3. 设计自己的协议扩展（如自定义 MCP 通知类型）
-4. 对比 MCP/ACP 与 LSP (Language Server Protocol) 的架构异同
+1. 研究 MCP 的 Sampling 协议及其安全模型，理解反向调用的安全控制机制
+2. 理解 StreamableHTTP 传输的 SSE + POST 双向通信机制，对比与 WebSocket 的优劣
+3. 设计自己的协议扩展（如自定义 MCP 通知类型、ACP 能力扩展）
+4. 对比 MCP/ACP 与 LSP (Language Server Protocol) 的架构异同，分析协议设计的权衡
+5. 思考如何在 Hermes 的基础上扩展更多的协议支持，如 OpenAI 插件协议、Anthropic 工具使用协议等
+
+## 九、关键设计模式总结
+
+Hermes 的 MCP/ACP 集成实现了多种经典设计模式的完美结合：
+
+| 设计模式 | 应用场景 | 优势 |
+|---------|---------|------|
+| **代理模式** | MCP 工具代理 | 对 Agent 隐藏远程调用细节，透明使用 MCP 工具 |
+| **适配器模式** | ACP 事件回调适配 | 将 AIAgent 的内部回调接口转换为 ACP 协议要求的格式 |
+| **观察者模式** | MCP 动态工具发现、EventBridge 事件通知 | 松耦合的事件传播机制，支持动态扩展 |
+| **工厂模式** | 工具 handler 工厂、回调工厂 | 根据参数动态生成定制化的处理函数 |
+| **单例模式** | MCP 事件循环、工具注册表 | 全局唯一实例，避免资源浪费和状态不一致 |
+| **桥接模式** | 同步-异步线程桥接 | 解同步业务逻辑和异步 IO 处理，提高系统响应性 |
+
+这些设计模式的综合应用使得 Hermes 的协议集成具有良好的扩展性、可维护性和兼容性。
