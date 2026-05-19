@@ -53,6 +53,7 @@
 - **`_invoke_tool()`**: 单工具执行，处理 agent 级工具（todo、memory、delegate_task）
 - **`_interruptible_api_call()`**: 带中断和超时保护的 API 调用
 - **`_compress_context()`**: 上下文压缩，自动总结历史消息以适配模型窗口
+- **`_handle_max_iterations()`**: 预算耗尽时发出一次独立的无工具 API 调用，请求模型总结
 
 ### 2.2 `IterationBudget` 类
 
@@ -148,7 +149,7 @@ def _execute_tool_calls(self, assistant_message, messages, effective_task_id, ap
 
 #### 并行判定规则：
 - 工具数量 <= 1 时串行
-- 包含交互工具（clarify、delegate_task 等）时串行
+- 包含交互工具（clarify 等）时串行
 - 路径作用域工具（文件读写等）路径重叠时串行
 - 只读工具和路径不冲突的文件工具允许并行
 - 最多并行 8 个工具，避免资源耗尽
@@ -296,7 +297,7 @@ run_conversation() 入口
     │
     └─ 4. 主循环 ─────────────────────────────
          │
-         ├─ while api_call_count < max_iterations and iteration_budget.remaining > 0 or _budget_grace_call:
+         ├─ while api_call_count < max_iterations and iteration_budget.remaining > 0:
          │    ├─ 检查中断请求（用户取消、超时等）
          │    ├─ 消耗迭代预算（execute_code 会退还）
          │    ├─ 调用 step_callback 钩子
@@ -340,7 +341,7 @@ run_conversation() 入口
          │         └─ 跳出循环
          │
          └─ 5. 后处理
-              ├─ 预算耗尽 → 请求摘要或返回部分结果
+              ├─ 预算耗尽 → 调用 _handle_max_iterations() 发出最终总结请求
               ├─ 保存完整 trajectory 到会话数据库
               ├─ 清理任务资源（终端、浏览器、MCP 会话等）
               ├─ 持久化会话元数据（token 用量、成本、耗时等）
@@ -388,7 +389,7 @@ run_conversation() 入口
 
 ### 5.1 错误分类体系
 
-`error_classifier.py` 定义了 13 种 `FailoverReason` 枚举：
+`error_classifier.py` 定义了 **14** 种 `FailoverReason` 枚举：
 
 | 分类 | HTTP 状态 | 恢复策略 |
 |------|-----------|----------|
@@ -401,9 +402,9 @@ run_conversation() 入口
 | `payload_too_large` | 413 | 压缩历史 |
 | `thinking_signature` | 400 (Anthropic) | 剥离 thinking blocks |
 | `long_context_tier` | 429 (Anthropic) | 降低 context_length |
-| `invalid_request` | 400 | 参数修正或重试 |
+| `format_error` | 400 | 参数修正或重试 |
+| `model_not_found` | 404 | 降级到 fallback 模型 |
 | `timeout` | N/A | 重试或切换 provider |
-| `connection_error` | N/A | 重试或切换 provider |
 | `unknown` | N/A | 降级到 fallback |
 
 ### 5.2 Jittered Backoff 重试策略
@@ -416,6 +417,10 @@ def jittered_backoff(attempt, base_delay=5.0, max_delay=120.0, jitter_ratio=0.5)
 ```
 
 使用去相关抖动避免多会话同时重试的"惊群效应"。重试间隔从 5s 开始指数增长，最长 2 分钟。
+
+> **注意**：以上为函数签名的默认参数。实际调用处有两处：
+> - API 调用重试循环：`jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)`
+> - 凭证/传输层异常重试：`jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)`
 
 ### 5.3 特殊恢复机制
 
@@ -434,10 +439,12 @@ def jittered_backoff(attempt, base_delay=5.0, max_delay=120.0, jitter_ratio=0.5)
 ### 6.1 主循环终止条件
 
 ```python
-while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0):
 ```
 
-两个独立的终止条件：`api_call_count` 是本 turn 内的计数，`iteration_budget` 是跨 turn 的全局预算。`_budget_grace_call` 允许预算耗尽后再执行一次迭代，用于生成最终回答。
+两个独立的终止条件：`api_call_count` 是本 turn 内的计数，`iteration_budget` 是跨 turn 的全局预算。
+
+> **重要说明**：代码中存在 `_budget_grace_call` 标志位（在 `__init__` 中初始化为 `False`），且被包含在 while 条件判断中（`or self._budget_grace_call`），但该标志位在整个代码库中**从未被设置为 `True`**，因此它是死代码。实际的预算耗尽处理机制是：主循环正常退出后，`run_conversation()` 检查到 `final_response` 为 `None` 且预算耗尽，随即调用 `_handle_max_iterations()` 方法——该方法注入一条 user 消息并发出一次**独立的无工具 API 调用**，请求模型对已完成工作进行总结。这种设计比在主循环内处理更清晰，因为总结请求本身不需要工具调用。
 
 ### 6.2 工具并行判定
 
@@ -447,7 +454,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
         return False
     tool_names = [tc.function.name for tc in tool_calls]
     if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
-        return False  # clarify 等交互工具永远串行
+        return False  # clarify 永远串行
     # 路径作用域工具检查路径不重叠
     reserved_paths = []
     for tool_call in tool_calls:
@@ -458,6 +465,8 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             reserved_paths.append(scoped_path)
     return True
 ```
+
+`_NEVER_PARALLEL_TOOLS` 定义为 `frozenset({"clarify"})`——注意它**仅包含** `clarify` 一个工具，不包含 `delegate_task` 等。
 
 ### 6.3 类型强制转换
 
@@ -523,6 +532,35 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 
 自动处理同步/异步工具的执行，统一错误格式，避免工具异常导致整个 Agent 崩溃。
 
+### 6.6 流式 vs 非流式 API 调用架构
+
+`_interruptible_api_call` 实际上是流式和非流式两个实现的统一入口：
+
+**流式路径** (`_interruptible_streaming_api_call`)：
+- 通过 `stream_delta_callback` 回调逐 token 传递增量内容，实现实时 UI 更新和 TTS
+- 内置 **90s stale-stream 检测**：如果 90s 内未收到任何新 chunk，视为连接僵死，触发终止
+- **60s 读取超时**：单次 socket 读取的超时保护
+- 支持 Anthropic Messages、OpenAI Chat Completions、Codex Responses 三种流式格式
+- 流式结束后将累积内容组装为与非流式一致的响应结构，统一后续处理逻辑
+- 工具调用期间自动抑制文本流式输出，避免 UI 混淆
+
+**非流式路径** (`_interruptible_api_call` 内部同步等待分支)：
+- 同样有 stale 检测（90s 无响应则终止）
+- 当 provider 或 API 模式不支持流式时自动降级
+- 作为流式不可用时的可靠后备方案
+
+**降级策略**：当流式调用失败且错误指示 provider 不支持流式传输时，自动回退到非流式模式重试。
+
+### 6.7 多 Provider 适配器架构
+
+Hermes Agent 通过适配器层将内部统一的 OpenAI 格式消息转换为不同 provider 的原生格式：
+
+- **`agent/anthropic_adapter.py`**：将 OpenAI 格式的消息、工具定义、reasoning 配置翻译为 Anthropic Messages API 格式，并处理 Anthropic 特有的响应结构（thinking blocks、stop_reason 等）
+- **`agent/bedrock_adapter.py`**：将消息转换为 AWS Bedrock Converse API 格式，维护模型上下文长度的精选映射表
+- **通用适配模式**：`build_*_kwargs()` 函数处理请求翻译，`normalize_*_response()` 函数将响应标准化回内部格式
+
+这使得上游 Agent 循环代码无需感知 provider 差异，只需使用 `api_mode` 选择策略即可。
+
 ---
 
 ## 七、面试八股文
@@ -532,13 +570,14 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 **ReAct (Reasoning + Acting)** 是一种让 LLM 交替进行推理和行动的范式。模型先"思考"（reasoning），再"行动"（调用工具），观察工具结果后继续推理，直到完成任务。
 
 **关键考量**：
-1. 终止条件多样化：不只有 `max_iterations`，还有 `IterationBudget`、`_budget_grace_call`、中断信号等
+1. 终止条件多样化：不只有 `max_iterations`，还有 `IterationBudget`、中断信号等
 2. 无限循环防护：多种重试计数器各有上限，成功执行工具后重置
 3. 空响应恢复：模型可能返回只有 thinking 没有 content 的响应，需要多重恢复策略
 4. 上下文膨胀控制：实时监控 token 用量，自动触发压缩
 5. 多 provider 兼容：同一个循环需要处理不同 API 格式和错误类型
 6. 工具执行安全：并行执行的线程安全、路径冲突检测、资源限制
 7. 用户体验：流式输出、进度反馈、中断支持、错误友好提示
+8. 预算耗尽处理：主循环退出后通过 `_handle_max_iterations()` 发出独立总结请求，而非在主循环内处理
 
 ### 7.2 Function Calling / Tool Use 的实现原理
 
@@ -557,7 +596,7 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 ### 7.3 如何处理 LLM 返回的 tool_calls？
 
 1. **名称验证**：遍历 `tool_calls`，检查是否在 `valid_tool_names` 中
-2. **自动修复**：`_repair_tool_call()` 尝试模糊匹配幻觉工具名（编辑距离 <= 2）
+2. **自动修复**：`_repair_tool_call()` 使用 `difflib.get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)` 进行模糊匹配，成功匹配时自动修复幻觉工具名
 3. **参数验证**：空字符串 → `{}`，截断检测（参数是否以 `}`/`]` 结尾）
 4. **类型转换**：`coerce_tool_args()` 将字符串参数转换为 schema 声明的类型
 5. **Guardrails**：限制 delegate 深度 <= 2，去重重复工具调用，检查资源权限
@@ -568,7 +607,7 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 
 至少有 **12 种** 终止条件：
 1. `api_call_count >= max_iterations`（本轮迭代次数耗尽）
-2. `iteration_budget.remaining <= 0`（全局迭代预算耗尽且无 grace call）
+2. `iteration_budget.remaining <= 0`（全局迭代预算耗尽）
 3. `_interrupt_requested`（用户中断、超时、会话过期）
 4. `final_response is not None`（模型返回最终回答，无工具调用）
 5. 非可重试的客户端错误（参数错误、权限不足等）
@@ -578,13 +617,13 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 9. 无效工具调用重试耗尽（3 次无效工具后放弃）
 10. 不完整 scratchpad 重试耗尽（3 次截断后放弃）
 11. 思考预算耗尽（模型用完输出 token 但无可见内容）
-12. `_budget_grace_call` 完成（预算耗尽后的最后一次迭代结束）
+12. 预算耗尽后 `_handle_max_iterations()` 完成（一次独立的无工具 API 调用请求总结，完成后无论结果如何都终止）
 
 ### 7.5 如何防止 Agent 陷入无限循环？
 
 1. **`IterationBudget`**：线程安全的全局计数器，跨轮次限制总迭代次数
 2. **多重试计数器归零机制**：成功执行工具后重置空响应、无效工具等计数器
-3. **`_budget_grace_call`**：预算耗尽后再给一次机会生成最终回答，避免卡在工具调用循环
+3. **预算耗尽后 `_handle_max_iterations()` 兜底**：循环退出后发出独立的无工具总结请求，避免卡在工具调用-失败循环中
 4. **`execute_code` 退还机制**：程序化工具调用不消耗迭代预算，避免被恶意循环利用
 5. **上下文压缩后重置重试计数器**：压缩后模型获得新的上下文，给予更多重试机会
 6. **重复内容检测**：检测到连续 3 次相同的工具调用或回答时，终止循环并提示
@@ -653,19 +692,24 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 
 当 token 用量超过阈值（默认 50% 模型上下文窗口），`ContextCompressor` 将中间消息（保留首 3 条 + 尾 20 条）用辅助 LLM 生成摘要，替换为一条 summary 消息。最多尝试 3 次压缩。
 
-压缩流程：
-1. 保留前 3 条消息（系统提示、关键初始信息）
-2. 保留最后 20 条消息（最近对话上下文）
-3. 中间的消息批量发送给辅助 LLM 生成摘要
-4. 摘要消息插入到保留消息中间，替换原中间消息
-5. 重新估算 token 用量，如果仍超过阈值，重复压缩过程
-6. 压缩后重置重试计数器，模型获得"干净"的上下文继续执行
+**ContextCompressor 核心参数：**
+- `protect_first_n: int = 3` — 保护前缀消息数量（系统提示、关键初始信息）
+- `protect_last_n: int = 20` — 保护尾部消息数量（最近对话上下文）
+- `summary_target_ratio: float = 0.20` — 压缩后摘要占上下文窗口的目标比例
+- `_SUMMARY_TOKENS_CEILING = 12,000` — 摘要 token 上限，长上下文模型也受此限制
+- `_MIN_SUMMARY_TOKENS = 2,000` — 摘要 token 下限，确保即使窗口很小也有足够的摘要信息
+- `SUMMARY_PREFIX` — 摘要消息的前缀标记，便于后续代码识别和移除旧摘要
 
-压缩策略配置：
-- 可自定义保留的首尾消息数量
-- 可自定义压缩阈值（0.3-0.9 窗口大小）
-- 可自定义辅助 LLM 模型（默认使用 GPT-3.5-turbo 降低成本）
-- 可禁用压缩（适合短对话场景）
+**压缩流程：**
+1. 保留前 `protect_first_n` 条消息（系统提示、关键初始信息）
+2. 保留最后 `protect_last_n` 条消息（最近对话上下文）
+3. **工具输出裁剪**：在 LLM 压缩之前先对中间的工具结果消息进行裁剪，移除过长输出
+4. 中间的消息批量发送给辅助 LLM 生成摘要，目标 token 数 = `min(context_length * summary_target_ratio, _SUMMARY_TOKENS_CEILING)`，不低于 `_MIN_SUMMARY_TOKENS`
+5. 摘要消息以 `SUMMARY_PREFIX` 为前缀插入到保留消息中间，替换原中间消息
+6. 重新估算 token 用量，如果仍超过阈值，重复压缩过程
+7. 压缩后重置重试计数器，模型获得"干净"的上下文继续执行
+
+**ContextEngine 替代方案**：除了内置的 `ContextCompressor`，系统还支持通过插件加载 `ContextEngine`——这是一种可插拔的上下文压缩策略抽象，允许第三方提供定制的压缩算法（如语义聚类压缩、分层摘要等），通过 `plugins/context_engine/` 目录加载，共享 `_context_engine_tool_names` 工具集。
 
 ### Q5: delegate_task 子 Agent 是怎么工作的？
 
@@ -680,7 +724,7 @@ def dispatch(self, name: str, args: dict, **kwargs) -> str:
 
 ### Q6: 为什么 streaming 比 non-streaming 更受欢迎？
 
-streaming 提供更细粒度的健康检查（90s  stale-stream 检测，60s 读超时），而非 streaming 模式在 provider 不返回响应时可能无限挂起。
+streaming 提供更细粒度的健康检查（90s stale-stream 检测，60s 读超时），而非 streaming 模式在 provider 不返回响应时可能无限挂起。
 
 其他优点：
 - 用户体验更好：实时显示思考过程和回答，无需等待完整响应
@@ -708,11 +752,11 @@ streaming 提供更细粒度的健康检查（90s  stale-stream 检测，60s 读
 
 ### Q8: 如何处理 LLM 幻觉出的工具名？
 
-1. **`_repair_tool_call()`** 尝试模糊匹配已知工具名，编辑距离 <= 2 时自动修复
+1. **`_repair_tool_call()`** 使用 `difflib.get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)` 进行模糊匹配，匹配成功时自动修复
 2. 如果无法修复，返回工具错误消息让模型自行纠正，最多重试 3 次
 3. 3 次失败后终止循环，返回部分结果和错误提示
 
-模糊匹配示例：
+模糊匹配示例（基于 difflib 序列相似度）：
 - "web_sarch" → "web_search"
 - "wite_file" → "write_file"
 - "termial" → "terminal"
@@ -742,9 +786,11 @@ streaming 提供更细粒度的健康检查（90s  stale-stream 检测，60s 读
 - 支持自定义存储后端（MySQL、PostgreSQL、S3 等）
 - 自动清理旧会话，支持保留策略配置
 
-### Q11: Tool result storage 是什么？
+### Q11: Tool Result Storage 是什么？
 
-超大工具输出保存到临时文件，在消息中只保留文件路径引用，避免上下文膨胀。工具结果超过 `max_result_size_chars`（默认 10000 字符）时自动触发。
+超大工具输出通过 `maybe_persist_tool_result()` 保存到临时文件，在消息中只保留摘要和文件路径引用，避免上下文膨胀。工具结果超过 `max_result_size_chars`（默认 10000 字符）时自动触发。
+
+`enforce_turn_budget()` 在每轮工具执行后检查工具结果消息的总大小，确保不超出本轮预算上限，超出时自动裁剪最旧的消息以释放空间。
 
 优点：
 - 避免工具大输出导致上下文窗口溢出
@@ -825,7 +871,32 @@ Agent 循环结束后，在守护线程中创建临时 Agent fork，让模型决
 
 ---
 
-## 九、学习路径建议
+## 九、系列文档交叉引用
+
+本文是 Hermes Agent 深度分析系列的第 1 篇，建议按以下顺序阅读：
+
+| 编号 | 文档 | 内容简介 |
+|------|------|----------|
+| 01 | **核心 Agent 循环深度分析**（本文） | ReAct 循环、API 调用、错误恢复 |
+| 02 | 工具系统架构深度分析 | 工具注册、并行调度、类型转换、工具审计 |
+| 03 | Gateway 消息平台网关深度分析 | 多平台消息接入、路由分发、状态管理 |
+| 04 | CLI 交互式终端系统深度分析 | 终端 UI、REPL、交互模式 |
+| 05 | 记忆与学习系统深度分析 | 向量记忆、技能学习、背景审查 |
+| 06 | MCP-ACP 协议集成深度分析 | MCP 工具集成、ACP 协议支持 |
+| 07 | Agent 内部子系统深度分析 | delegate_task、checkpoint、SafeWriter 等 |
+| 08 | 基础设施与研究工具深度分析 | 日志、监控、评估、实验管理 |
+
+各篇之间的关系：
+- 本文（01）覆盖 Agent 运行时核心，是理解其他模块的前提
+- 02（工具系统）依赖本文的工具执行和注册机制
+- 03（Gateway）依赖本文的对话管理和回调钩子
+- 05（记忆）依赖本文的后台审查和异步处理
+- 07（子系统）依赖本文的 delegate_task 和内部机制
+- 04、06、08 为独立模块，可在理解核心循环后单独阅读
+
+---
+
+## 十、学习路径建议
 
 ### 阶段 1：理解骨架（1-2 小时）
 1. `model_tools.py`（全文 563 行）-- 工具注册和分发核心

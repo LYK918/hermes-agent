@@ -11,8 +11,8 @@ CLI 系统采用分层架构，实现了高内聚低耦合的设计：
 | 层次 | 文件 | 职责 | 核心功能 |
 |------|------|------|----------|
 | 入口层 | `hermes_cli/main.py` | argparse 子命令注册、profile 覆盖、env 加载 | 50+ 子命令定义、参数解析、命令路由、启动前检查 |
-| 交互层 | `cli.py` | `HermesCLI` 类，基于 prompt_toolkit 的 TUI 主循环 | 8000+ 行代码，包含事件循环、输入处理、流式输出、模态交互、会话管理 |
-| 命令注册 | `hermes_cli/commands.py` | `CommandDef` 数据结构、自动补全/建议 | 60+ 内置命令定义、单源多端分发、命令查找与解析 |
+| 交互层 | `cli.py` | `HermesCLI` 类，基于 prompt_toolkit 的 TUI 主循环 | 8000+ 行代码，包含混合线程模型、输入处理、流式输出、模态交互、会话管理 |
+| 命令注册 | `hermes_cli/commands.py` | `CommandDef` 数据结构、自动补全/建议 | 51 内置命令定义、单源多端分发、命令查找与解析 |
 | 配置层 | `hermes_cli/config.py` | YAML 配置加载/合并、环境变量桥接 | 多层级配置合并、环境变量展开、配置验证、原子写入 |
 | 主题层 | `hermes_cli/skin_engine.py` | `SkinConfig` 数据结构、动态切换 | 9 个内置主题、自定义主题支持、实时主题切换、惰性 ANSI 渲染 |
 | 模型层 | `hermes_cli/models.py` / `model_switch.py` | 多提供商模型目录 | 20+ 模型提供商支持、模型自动发现、配置校验、参数归一化 |
@@ -28,7 +28,7 @@ CLI 系统采用分层架构，实现了高内聚低耦合的设计：
 项目构建了完整的 `Application` 对象（非简单的 `prompt()`），实现固定底部输入区、状态栏、spinner 等 TUI 元素。
 
 **核心架构特点**：
-- 全异步事件循环，支持中断输入和流式输出
+- 混合并发模型：prompt_toolkit Application 在主线程以 asyncio 事件循环驱动 UI 渲染和按键处理；Agent 执行和输入处理在后台线程（`threading.Thread`）中运行
 - `patch_stdout` 代理系统输出，确保输出不会破坏底部输入区
 - 自定义布局系统，支持动态显示/隐藏状态栏、模态框等元素
 - 可扩展的按键绑定系统，支持多模式交互（命令输入、选择确认、密码输入等）
@@ -77,33 +77,57 @@ class HermesCLI:
 入口 main() → HermesCLI 初始化 → show_banner() → 恢复会话（如果指定）
 → 配置文件监听器启动 → 注册系统回调（sudo/approval/secret）
 → 键盘绑定初始化 → 构建 prompt_toolkit Application 对象
-→ 启动 process_loop 协程 → app.run() 进入事件循环
+→ 启动 spinner_thread + process_thread（两个 daemon 线程）
+→ app.run() 进入主线程 asyncio 事件循环
 ```
 
-**process_loop 核心逻辑**：
+**并发模型详解**：
+
+CLI 采用**混合线程 + asyncio**架构，而非纯异步事件循环：
+
+- **主线程**：运行 prompt_toolkit `Application.run()`，持有 asyncio 事件循环，负责 UI 渲染和按键事件处理
+- **process_thread**（daemon threading.Thread）：运行 `process_loop()` 同步函数，处理输入队列、配置监控、Agent 调用
+- **agent_thread**（daemon threading.Thread）：chat() 中启动，执行实际的 Agent 调用和结果处理
+- **spinner_thread**（daemon threading.Thread）：运行 spinner 动画帧更新
+
+**process_loop 核心逻辑**（同步函数，运行在后台线程）：
+
 ```python
-async def process_loop(self):
+def process_loop():
     while not self._should_exit:
-        # 检查配置文件变更，自动重载 MCP 服务器
-        self._check_config_changes()
+        try:
+            user_input = self._pending_input.get(timeout=0.1)
+        except queue.Empty:
+            # 定期检查 MCP 配置变更（仅监控 mcp_servers 节）
+            if not self._agent_running:
+                self._check_config_mcp_changes()
+                # 检查后台进程完成通知
+                ...
+            continue
         
-        # 等待用户输入
-        payload = await self._pending_input.get()
-        
-        if isinstance(payload, tuple):
-            text, images = payload
-        else:
-            text, images = payload, []
+        if not user_input:
+            continue
             
-        # 处理斜杠命令
-        if text.startswith('/'):
-            if not self.process_command(text):
+        # 解包图片附件
+        if isinstance(user_input, tuple):
+            user_input, submit_images = user_input
+        
+        # 处理斜杠命令 / 正常对话
+        if user_input.startswith('/'):
+            if not self.process_command(user_input):
                 self._should_exit = True
                 break
             continue
             
-        # 正常对话流程
-        await self.chat(text, images=images)
+        self.chat(user_input, images=submit_images)
+```
+
+关键点：`process_loop` 是**同步函数**（`def process_loop():`），使用 `queue.Queue.get(timeout=0.1)` 阻塞等待输入而非 `await asyncio.Queue.get()`。prompt_toolkit 的 asyncio 事件循环仅在主线程运行，用于处理 UI 渲染和按键事件。
+
+```python
+# cli.py line 9665-9666: process_loop 运行在 threading.Thread 中
+process_thread = threading.Thread(target=process_loop, daemon=True)
+process_thread.start()
 ```
 
 ### 2.2 多行编辑与自动补全
@@ -163,29 +187,56 @@ def generate_bash(parser: argparse.ArgumentParser) -> str:
 #### 2.3.1 流式响应处理
 
 `_stream_delta()` 方法实现了高效的流式输出处理：
-- **行缓冲**：增量内容缓存到 `_stream_buf`，遇到完整行才输出到终端
-- **推理标签抑制**：`<think>` 等标签路由到专用推理显示框或直接丢弃，不影响正常输出
-- **ANSI 渲染**：通过 `prompt_toolkit.formatted_text.ANSI` 解析富文本格式，支持颜色、粗体、下划线等
-- **标签过滤**：自动识别并处理特殊标签，如 `|tool_call|`、`|file_change|` 等，渲染为对应的富UI组件
+- **推理/思考标签抑制**：识别 `<REASONING_SCRATCHPAD>`、`<think>`、`<reasoning>`、`<THINKING>`、`<thinking>`、`<thought>` 等标签，配合边界检测算法（仅在流起点、换行后或行首空白后匹配才算块边界），防止模型在文中引用标签名时误触发
+- **边界检测**：通过 `_stream_last_was_newline` 标记跟踪是否处于行边界，非边界位置的标签被视作普通文本输出
+- **预过滤缓冲区**：增量文本先进入 `_stream_prefilt` 缓冲，完成边界判断后再输出；部分标签末尾可能被截断时暂不输出，等待后续增量
 
 **核心实现逻辑**：
 ```python
-def _stream_delta(self, delta: str):
-    self._stream_buf += delta
-    # 检查是否有完整行
+def _stream_delta(self, text) -> None:
+    """Line-buffered streaming callback for real-time token rendering.
+    
+    Reasoning/thinking blocks are suppressed during streaming by
+    boundary-aware tag matching. Only tags appearing at block boundaries
+    (stream start, after newline with optional whitespace) trigger
+    suppression — inline mentions in prose are emitted normally.
+    """
+    # Tag-based reasoning suppression with boundary detection
+    _OPEN_TAGS = ("<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
+                   "<THINKING>", "<thinking>", "<thought>")
+    _CLOSE_TAGS = ("</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
+                    "</THINKING>", "</thinking>", "</thought>")
+    
+    self._stream_prefilt = getattr(self, "_stream_prefilt", "") + text
+    
+    # Check for open tag at block boundary
+    if not self._in_reasoning_block:
+        for tag in _OPEN_TAGS:
+            idx = self._stream_prefilt.find(tag)
+            if idx == -1:
+                continue
+            # Verify block boundary: tag must be at start or after newline
+            preceding = self._stream_prefilt[:idx]
+            is_boundary = (idx == 0 and self._stream_last_was_newline) or \
+                          (preceding.rfind('\n') != -1 and 
+                           preceding[preceding.rfind('\n')+1:].strip() == "")
+            if is_boundary:
+                self._emit_stream_text(preceding)  # emit before-tag text
+                self._in_reasoning_block = True
+                self._stream_prefilt = self._stream_prefilt[idx + len(tag):]
+                break
+    
+    # If still in reasoning block, look for close tag
+    if self._in_reasoning_block:
+        # ... accumulate until close tag found, then suppress or route to
+        # reasoning display box if show_reasoning enabled
+        pass
+    
+    # Complete line emission
+    self._stream_buf += text
     while '\n' in self._stream_buf:
         line, self._stream_buf = self._stream_buf.split('\n', 1)
-        # 处理特殊标签
-        if line.startswith('<think>'):
-            self._handle_reasoning_output(line)
-        elif line.startswith('|tool_call|'):
-            self._handle_tool_call_output(line)
-        else:
-            # 普通文本输出
-            self._output_formatted_line(line)
-    # 处理剩余不完整行
-    if self._stream_buf:
-        self._update_incomplete_line(self._stream_buf)
+        _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}")
 ```
 
 #### 2.3.2 进度动画系统
@@ -376,23 +427,41 @@ def _is_gateway_available(cmd: CommandDef) -> bool:
 
 ### 4.1 配置加载流程
 
-配置系统采用四层加载架构，确保灵活的配置管理：
+配置系统由**两套独立的配置加载路径**组成，分别服务于不同的运行时上下文：
+
+#### 4.1.1 核心配置路径（`hermes_cli/config.py` 中的 `load_config()`）
+
+应用于 Agent 行为、安全策略、MCP 服务器等核心功能的配置：
 
 ```
 1. 内置默认配置（代码中 DEFAULT_CONFIG 字典）
    ↓
-2. 用户主目录配置（~/.hermes/config.yaml）
+2. 用户主目录配置（~/.hermes/config.yaml）→ 深度合并覆盖
    ↓
-3. 项目目录配置（./cli-config.yaml）
-   ↓
-4. 环境变量覆盖（HERMES_* 开头的环境变量）
+3. 环境变量展开（${ENV_VAR} 语法替换为运行时环境变量值）
 ```
 
+**特点**：两层深度合并（DEFAULT_CONFIG + 用户 YAML）+ 环境变量展开。没有项目级本地配置、没有环境变量覆盖层。
+
+#### 4.1.2 CLI 显示配置路径（`cli.py` 中的 `load_cli_config()`）
+
+应用于终端显示、模型路由、快捷键等交互层配置：
+
+```
+1. cli.py 内联默认值（defaults 字典）
+   ↓
+2. EITHER ~/.hermes/config.yaml（用户配置，优先）
+   OR ./cli-config.yaml（项目级配置，回退）
+   ↓
+3. 环境变量桥接（将配置值映射到对应的系统环境变量）
+```
+
+**特点**：从用户配置或项目配置中二选一（用户配置优先），然后桥接到系统环境变量供底层模块使用。两个文件不会合并。
+
 **核心处理步骤**：
-1. 配置查找优先级：环境变量 > 项目配置 > 用户配置 > 默认配置
-2. 深度合并：字典类型递归合并，标量类型直接覆盖
-3. 环境变量展开：`${ENV_VAR}` 语法支持引用系统环境变量
-4. 环境变量桥接：配置值自动映射到对应的环境变量供其他模块使用
+1. 核心路径：DEFAULT_CONFIG → 深度合并用户 YAML → `${ENV_VAR}` 展开
+2. CLI 路径：内联 defaults → 选用户或项目 YAML → 环境变量桥接
+3. 配置安全：目录权限 0700，文件权限 0600，原子写入防止截断
 
 ### 4.2 配置安全
 
@@ -404,19 +473,39 @@ def _is_gateway_available(cmd: CommandDef) -> bool:
 
 ### 4.3 运行时配置重载
 
-CLI 支持配置文件热重载，无需重启即可生效：
+CLI 支持配置文件热重载，但**仅监控 MCP 服务器配置变更**，而非完整配置重载：
+
 ```python
-def _check_config_changes(self):
-    """检查配置文件变更，自动重载 MCP 服务器等配置"""
-    if self._config_mtime != os.path.getmtime(self._config_path):
-        self._config_mtime = os.path.getmtime(self._config_path)
-        new_config = load_config()
-        # 对比差异，只重载变更的部分
-        if new_config.get("mcp_servers") != self.config.get("mcp_servers"):
-            self._reload_mcp_servers(new_config["mcp_servers"])
-        # 更新内存中的配置
-        self.config = new_config
+def _check_config_mcp_changes(self) -> None:
+    """Detect mcp_servers changes in config.yaml and auto-reload MCP."""
+    CONFIG_WATCH_INTERVAL = 5.0  # seconds between config.yaml stat() calls
+    
+    now = time.monotonic()
+    if now - self._last_config_check < CONFIG_WATCH_INTERVAL:
+        return
+    self._last_config_check = now
+    
+    # Check config file mtime
+    mtime = cfg_path.stat().st_mtime
+    if mtime == self._config_mtime:
+        return  # File unchanged
+    
+    self._config_mtime = mtime
+    new_cfg = yaml.safe_load(f) or {}
+    new_mcp = new_cfg.get("mcp_servers") or {}
+    
+    # Only reload if mcp_servers section actually changed
+    if new_mcp == self._config_mcp_servers:
+        return  # Some OTHER section was edited — ignore
+    
+    self._config_mcp_servers = new_mcp
+    # Reload MCP in separate thread with 30s timeout
+    _reload_thread = threading.Thread(target=self._reload_mcp, daemon=True)
+    _reload_thread.start()
+    _reload_thread.join(timeout=30)
 ```
+
+关键点：该方法名是 `_check_config_mcp_changes()`，仅比较 `mcp_servers` 节是否变更。如果用户修改了 model、display 或其他配置节，方法会检测到 mtime 变化但最终跳过（因为 mcp_servers 未变）。其他配置变更需要重启 CLI 才能生效。
 
 ### 4.4 Profile 管理系统
 
@@ -457,9 +546,9 @@ class SkinConfig:
     banner_logo: str = ""
 ```
 
-8 个内置主题：default, ares, mono, slate, daylight, warm-lightmode, poseidon, sisyphus, charizard。
+9 个内置主题：default, ares, mono, slate, daylight, warm-lightmode, poseidon, sisyphus, charizard。
 
-用户可在 `~/.hermes/skins/<name>.yaml` 定义自定义主题。`_SkinAwareAnsi` 实现惰性 ANSI 转义，`/skin` 切换后清除缓存。
+用户可在 `~/.hermes/skins/<name>.yaml` 定义自定义主题。`_SkinAwareAnsi` 类（定义在 `cli.py` 中，非 `skin_engine.py`）实现惰性 ANSI 转义：首次 `__str__()` 调用时从皮肤引擎解析颜色并缓存，`/skin` 切换后调用 `.reset()` 清除缓存强制重新解析。
 
 ---
 
@@ -517,12 +606,278 @@ def _auto_detect_local_model(base_url: str) -> Optional[str]:
 
 ---
 
-## 七、设计模式
+## 七、Markdown 渲染管道
+
+### 7.1 渲染链路
+
+LLM 输出的 Markdown 文本经过完整的渲染管道才出现在用户终端：
+
+```
+Agent 流式输出（Markdown 文本）
+    ↓
+_stream_delta() 行缓冲 + 推理标签过滤
+    ↓
+_cprint() → print_formatted_text(ANSI(text))
+    ↓
+prompt_toolkit ANSI 解析器 → 颜色/粗体/下划线渲染
+    ↓
+Rich 渲染（Panel/Table/Syntax 等富组件）
+    ↓
+ChatConsole 捕获 Rich ANSI 输出 → 转回 _cprint()
+    ↓
+StdoutProxy → patch_stdout 安全输出到终端
+```
+
+### 7.2 关键组件
+
+**`_rich_text_from_ansi(text)`**：将 ANSI 转义文本转换回 Rich Text 对象，供 Rich Console 使用。
+
+**`_cprint(text)`**：CLI 核心输出函数，通过 `print_formatted_text(ANSI(text))` 将 ANSI 格式文本路由到 prompt_toolkit 的渲染管道。此路由确保输出经过 `patch_stdout` 代理，不会破坏底部固定输入区。
+
+**`ChatConsole` 类**：Rich Console 适配器。内部持有 Rich `Console` 对象渲染到 `StringIO` 缓冲区，然后将渲染后的 ANSI 文本通过 `_cprint()` 逐行输出。实现 `print()` 和 `status()` 接口，可用作 Rich Console 的 drop-in 替换：
+```python
+class ChatConsole:
+    """Rich Console adapter for prompt_toolkit's patch_stdout context."""
+    
+    def __init__(self):
+        self._buffer = StringIO()
+        self._inner = Console(
+            file=self._buffer,
+            force_terminal=True,
+            color_system="truecolor",
+            highlight=False,
+        )
+    
+    def print(self, *args, **kwargs):
+        self._buffer.seek(0)
+        self._buffer.truncate()
+        self._inner.width = shutil.get_terminal_size((80, 24)).columns
+        self._inner.print(*args, **kwargs)
+        output = self._buffer.getvalue()
+        for line in output.rstrip("\n").split("\n"):
+            _cprint(line)
+```
+
+---
+
+## 八、ChatConsole 路由
+
+### 8.1 输出路由机制
+
+`_cprint()` 和 `ChatConsole` 是 CLI 输出的**关键路由机制**，解决了一个核心问题：在 prompt_toolkit 的 TUI 环境中，直接调用 `print()` 会破坏底部固定输入区。
+
+所有输出必须通过以下路径：
+```
+代码中调用 _cprint(text)
+    ↓
+print_formatted_text(ANSI(text))
+    ↓
+prompt_toolkit 的 StdoutProxy（patch_stdout 上下文管理器）
+    ↓
+在底部输入区上方正确绘制，不破坏布局
+```
+
+### 8.2 使用场景
+
+- **流式输出**：`_stream_delta()` 中直接调用 `_cprint()` 输出每一行
+- **Rich 组件**：`ChatConsole().print()` 渲染 Rich Panel/Table/Syntax 后，逐行调用 `_cprint()`
+- **命令输出**：`_handle_skin_command()`、`_handle_background_command()` 等命令处理函数统一使用 `_cprint()` 输出结果
+- **状态消息**：工具执行状态、推理预览、完成通知等均通过 `_cprint()` 路由
+
+---
+
+## 九、CLI-to-Agent 集成
+
+### 9.1 完整 chat() 调用流程
+
+`HermesCLI.chat(message, images)` 是 CLI 与 Agent 集成的核心入口，涵盖多步预处理和安全机制：
+
+```
+chat(message, images)
+  │
+  ├─ 1. 凭证刷新 (_ensure_runtime_credentials)
+  │     → 检查 OAuth token 过期、API key rotation
+  │
+  ├─ 2. 智能模型路由 (_resolve_turn_agent_config)
+  │     → 简单查询路由到便宜模型 (smart_model_routing)
+  │     → 复杂查询使用当前主模型
+  │
+  ├─ 3. Agent 初始化 (_init_agent)
+  │     → 凭证变化/路由变化/模型变化时重建 Agent
+  │     → 应用模型覆盖、运行时覆盖、request_overrides
+  │
+  ├─ 4. 图片预处理 (_preprocess_images_with_vision)
+  │     → 通过 Gemini Flash vision 工具分析图片
+  │     → 将图片转换为文本描述注入消息
+  │     → 模型无关：任何模型都能"看到"图片
+  │
+  ├─ 5. @ 引用展开 (preprocess_context_references)
+  │     → @file:main.py → 注入文件内容
+  │     → @diff → 注入 git diff
+  │     → @folder:src/ → 注入目录树
+  │     → 上下文长度检查，防止超限
+  │
+  ├─ 6. 消息清理 (_sanitize_surrogates)
+  │     → 清理剪贴板粘贴引入的非法 UTF-8 代理对
+  │
+  ├─ 7. Agent 执行 (agent_thread 中运行)
+  │     → AIAgent.run() 在 daemon 线程中执行
+  │     → 主线程监控 _interrupt_queue 检测中断
+  │     → 流式回调 _stream_delta() 实时渲染输出
+  │
+  └─ 8. 后处理
+        → 更新 conversation_history
+        → TTS 语音输出（如果开启）
+        → 状态栏更新
+```
+
+### 9.2 智能模型路由
+
+`_resolve_turn_agent_config()` 根据用户消息特征自动选择最优模型：
+
+```python
+def _resolve_turn_agent_config(self, user_message: str) -> dict:
+    """Resolve model/runtime overrides for a single user turn."""
+    from agent.smart_model_routing import resolve_turn_route
+    
+    route = resolve_turn_route(
+        user_message,
+        self._smart_model_routing,  # 路由配置
+        {  # 当前运行时信息
+            "model": self.model,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "provider": self.provider,
+            ...
+        },
+    )
+    return route
+```
+
+路由规则基于消息长度（`max_simple_chars` 默认 160 字符）和词数（`max_simple_words` 默认 28 词）判断是否为"简单查询"。简单查询自动路由到配置的 `cheap_model`，节省成本。路由结果包含 `model`、`runtime`、`label` 和可选的 `request_overrides`。
+
+---
+
+## 十、多模态输入
+
+### 10.1 图片输入方式
+
+CLI 支持三种图片输入方式：
+
+**`/paste` 命令**：主动检查剪贴板中的图片。适用于终端不支持自动剪贴板检测的场景（如 VSCode 终端）。
+
+**`/image <path>` 命令**：手动指定本地图片文件路径。
+
+**拖放/粘贴检测**：`_detect_file_drop()` 自动识别用户粘贴或拖入的文件路径字符串，提取文件路径和行号信息，区分其与斜杠命令。
+
+### 10.2 图片预处理管道
+
+```python
+def _preprocess_images_with_vision(self, text, images):
+    """Analyze attached images via the vision tool.
+    
+    Instead of embedding raw base64 image data in the main conversation
+    (which only works with vision-capable models), this pre-processes
+    each image through the auxiliary vision model (Gemini Flash)
+    and returns enriched text descriptions. This works with any model.
+    """
+    from tools.vision_tools import vision_analyze_tool
+    
+    for img_path in images:
+        analysis = vision_analyze_tool(
+            image_url=str(img_path),
+            user_prompt=analysis_prompt
+        )
+        ...
+```
+
+设计理念：图片通过独立 vision model（Gemini Flash）预分析，主模型接收文本描述而非原始图片数据，确保非 vision-capable 模型也能处理图片输入。
+
+### 10.3 剪贴板图片自动检测
+
+`_try_attach_clipboard_image()` 在用户输入开头不为 `/` 时自动检测系统剪贴板中的图片，保存到 `~/.hermes/images/` 并自动附加到下一次对话。`_should_auto_attach_clipboard_image_on_paste()` 判断是否为纯图片粘贴手势，避免意外的图片附件。
+
+---
+
+## 十一、语音模式
+
+### 11.1 状态机设计
+
+语音模式通过 `/voice` 命令控制，是一个多状态切换系统：
+
+```
+                  /voice on
+   IDLE ─────────────────────────→ VOICE_READY
+                                       │
+                      Ctrl+B 按下       │    Ctrl+B 释放
+                                       ↓         ↓
+                                  RECORDING ──→ PROCESSING (STT)
+                                       │              │
+                                       │              ↓
+                                       │         自动发送到 Agent
+                                       │              │
+                                       └── Ctrl+B 停止录音
+```
+
+### 11.2 核心命令与状态
+
+**`/voice on`**：激活语音模式，启用键盘监听（Ctrl+B 开始/停止录音）
+**`/voice off`**：停用语音模式
+**`/voice tts`**：切换 TTS（文本转语音）开关
+**`/voice continuous`**：切换连续录音模式（每次回答后自动开始下一次录音）
+
+### 11.3 实现细节
+
+- **录音**：`_voice_start_recording()` 通过 `tools/voice_mode` 模块创建音频录制器，支持本地麦克风（sounddevice）和 Termux:API
+- **语音转文字（STT）**：支持 faster-whisper（本地免费）、Groq API（免费额度）、OpenAI API
+- **文字转语音（TTS）**：Agent 响应通过 TTS 引擎朗读，`text_queue` + `stop_event` 实现流式播放和中断
+- **连续录音**：每次对话完成后自动通过 `_restart_recording` 重新开始录音
+- **状态栏指示器**：录音中显示 ● REC，转换中显示 ◉ STT，就绪显示 🎤 Voice mode
+
+---
+
+## 十二、后台任务与 /btw
+
+### 12.1 后台任务 (/background)
+
+`/background <prompt>` 命令在独立的 daemon 线程中运行完整 Agent 会话，不影响当前对话：
+
+```python
+def _handle_background_command(self, cmd):
+    """Spawn a new AIAgent in a background thread with its own session."""
+    thread = threading.Thread(target=run_background, daemon=True,
+                              name=f"bg-task-{task_id}")
+    self._background_tasks[task_id] = thread
+    thread.start()
+```
+
+- 后台任务具有独立的 session_id，结果存入独立会话
+- 用户可继续正常对话，任务完成时通过 process_registry 通知打印结果
+- 后台线程是 daemon 线程，终端关闭时自动回收
+
+### 12.2 /btw 命令
+
+`/btw <question>` 创建仅用当前会话上下文的临时查询，不持久化、不使用工具、不修改主会话历史：
+
+```python
+def _handle_btw_command(self, cmd):
+    """Ephemeral side question using session context.
+    Snapshots current conversation history, spawns a no-tools agent
+    in a background thread, prints the answer without persisting.
+    """
+    thread = threading.Thread(target=run_btw, daemon=True,
+                              name=f"btw-{task_id}")
+    thread.start()
+```
+
+---
+
+## 十三、设计模式
 
 | 模式 | 应用 |
 |------|------|
 | 命令模式 | `CommandDef` 数据类 |
-| 模板方法 | `cmd_chat()` 定义骨架流程 |
+| 模板方法 | `chat()` 定义骨架流程 |
 | 建造者模式 | `HermesCLI.__init__()` 逐步构建状态 |
 | 策略模式 | `ProviderConfig` 注册表 |
 | 观察者模式 | 流式输出回调机制 |
@@ -530,9 +885,9 @@ def _auto_detect_local_model(base_url: str) -> Optional[str]:
 
 ---
 
-## 八、面试八股文
+## 十四、面试八股文
 
-### 8.1 prompt_toolkit vs readline
+### 14.1 prompt_toolkit vs readline
 
 | 特性 | prompt_toolkit | readline |
 |------|---------------|----------|
@@ -542,7 +897,7 @@ def _auto_detect_local_model(base_url: str) -> Optional[str]:
 | 异步 | 原生 asyncio | 同步 |
 | TUI 布局 | Application + Layout | 无 |
 
-### 8.2 配置管理方案对比
+### 14.2 配置管理方案对比
 
 | 格式 | 优点 | 缺点 |
 |------|------|------|
@@ -551,7 +906,7 @@ def _auto_detect_local_model(base_url: str) -> Optional[str]:
 | TOML | 人类可读 | 嵌套深时冗长 |
 | ENV | 简单、容器友好 | 扁平键值 |
 
-### 8.3 命令模式的实现
+### 14.3 命令模式的实现
 
 ```python
 @dataclass(frozen=True)
@@ -567,48 +922,21 @@ COMMAND_REGISTRY: list[CommandDef] = [
 ]
 ```
 
-### 8.4 流式输出实现原理
+### 14.4 流式输出实现原理
 
-SSE → 增量回调 → 行缓冲 → ANSI 渲染 → 标签过滤
+SSE → 增量回调 → 行缓冲 → 推理标签边界检测过滤 → ANSI 渲染 → prompt_toolkit 输出
 
-### 8.5 自动补全算法
+### 14.5 自动补全算法
 
 前缀匹配 + 模糊匹配评分（精确 > 前缀 > 子串 > 路径包含 > 缩写匹配）
 
 ---
 
-## 九、面试官可能问的问题
+## 十五、面试官可能问的问题
 
 ### Q1: 为什么选择 prompt_toolkit 而不是 curses？
 
 prompt_toolkit 是纯 Python 实现，无需编译，跨平台兼容性更好（Windows/macOS/Linux 原生支持）。原生支持 asyncio 事件循环，可以无缝集成到异步架构中。内置丰富的补全、建议、快捷键绑定 API，以及 `patch_stdout` 机制解决了异步输出与底部固定输入区的冲突问题。相比 curses 更易扩展和维护，开发效率更高。
-
-### Q11: CLI 如何实现非交互式批量执行？
-
-支持两种非交互式执行模式：
-1. **单次查询模式**：`hermes -q "your query"`，执行后自动退出，返回结果到 stdout
-2. **脚本模式**：通过管道输入多个查询，`cat queries.txt | hermes`，自动执行所有查询
-3. **工作流模式**：`hermes --workflow workflow.yaml`，执行预定义的多步骤任务流
-
-实现原理：
-- 检测标准输入是否为管道，自动切换到非交互式模式
-- 禁用所有需要用户输入的交互，默认选择安全选项
-- 输出格式可以配置为纯文本、JSON、Markdown 等
-- 执行状态通过退出码返回（0 成功，非 0 失败）
-
-### Q12: CLI 的会话持久化是如何实现的？
-
-会话数据存储在 SQLite 数据库 `~/.hermes/sessions.db` 中：
-- 每条会话包含 ID、标题、创建时间、更新时间、来源平台、消息历史
-- 消息历史以 JSON 格式存储，保留完整的角色、内容、工具调用、元数据
-- 支持会话分支，基于现有会话创建新分支，不影响原会话历史
-- 会话元数据独立存储，支持标签、收藏、归档等功能
-
-实现特性：
-- 增量写入，每次消息更新只写入变更部分，性能高效
-- 支持全文搜索，基于消息内容快速查找历史会话
-- 自动清理超过配置保留期的旧会话，节省存储空间
-- 会话导入/导出功能，支持跨设备同步
 
 ### Q2: 如何实现流式输出不破坏输入区？
 
@@ -646,9 +974,64 @@ CLI 向 Portal 发起设备授权请求 → 获取 device_code 和 user_code →
 
 跳过目录权限修改（使用组可读权限），`managed_error()` 打印升级指导。
 
+### Q11: CLI 如何实现非交互式批量执行？
+
+支持两种非交互式执行模式：
+1. **单次查询模式**：`hermes -q "your query"`，执行后自动退出，返回结果到 stdout
+2. **脚本模式**：通过管道输入多个查询，`cat queries.txt | hermes`，自动执行所有查询
+3. **工作流模式**：`hermes --workflow workflow.yaml`，执行预定义的多步骤任务流
+
+实现原理：
+- 检测标准输入是否为管道，自动切换到非交互式模式
+- 禁用所有需要用户输入的交互，默认选择安全选项
+- 输出格式可以配置为纯文本、JSON、Markdown 等
+- 执行状态通过退出码返回（0 成功，非 0 失败）
+
+### Q12: CLI 的会话持久化是如何实现的？
+
+会话数据存储在 SQLite 数据库 `~/.hermes/sessions.db` 中：
+- 每条会话包含 ID、标题、创建时间、更新时间、来源平台、消息历史
+- 消息历史以 JSON 格式存储，保留完整的角色、内容、工具调用、元数据
+- 支持会话分支，基于现有会话创建新分支，不影响原会话历史
+- 会话元数据独立存储，支持标签、收藏、归档等功能
+
+实现特性：
+- 增量写入，每次消息更新只写入变更部分，性能高效
+- 支持全文搜索，基于消息内容快速查找历史会话
+- 自动清理超过配置保留期的旧会话，节省存储空间
+- 会话导入/导出功能，支持跨设备同步
+
+### Q13: process_loop 为什么使用同步线程而不是纯 asyncio？
+
+采用 **threading.Thread + queue.Queue** 而非 asyncio 的设计决策基于以下考虑：
+
+1. **职责分离**：主线程的 asyncio 事件循环专注于 UI 渲染（prompt_toolkit Application），Agent 执行逻辑在独立线程中运行，互不阻塞
+2. **阻塞 API 兼容**：Agent 内部可能调用同步 I/O（文件读写、子进程调用），在 threading.Thread 中可以直接执行，无需 `async`/`await` 包装
+3. **中断响应**：`queue.Queue.get(timeout=0.1)` 以 100ms 粒度轮询，既能及时响应新输入，又能处理配置监控等定期任务
+4. **简单可靠**：避免了 asyncio 跨线程调度（`call_soon_threadsafe`）的复杂性，queue.Queue 天然线程安全
+
+这是一种**混合线程模型**而非全异步：prompt_toolkit 的 asyncio 事件循环处理 UI 事件 → `process_loop` 的同步线程处理业务逻辑 → 两者通过 `queue.Queue` 通信。
+
+### Q14: 为什么配置系统拆分为两套独立的加载路径？
+
+核心配置（`load_config()`）和 CLI 配置（`load_cli_config()`）分离的原因：
+
+1. **不同生命周期**：核心配置影响模型行为、MCP 工具等持久化选项，CLI 配置处理终端显示、快捷键等交互偏好。前者需要完整的配置验证和版本迁移，后者只需要轻量默认值
+2. **不同加载时机**：核心配置在 Agent 初始化时加载，CLI 配置在终端启动时加载
+3. **不同合并策略**：核心配置使用深度合并（DEFAULT_CONFIG + 用户 YAML），CLI 配置使用二选一（用户配置优先，回退到项目配置）
+4. **环境变量桥接**：CLI 配置需要将终端后端设置桥接到环境变量（DOCKER_HOST 等），核心配置通过 `${ENV_VAR}` 语法直接展开引用
+
+### Q15: 智能模型路由如何节省成本？
+
+`smart_model_routing` 通过消息特征分析自动选择模型：
+- 短消息（默认 < 160 字符）和少词数（默认 < 28 词）被判定为"简单查询"
+- 简单查询路由到 `cheap_model`（如 Gemini Flash），复杂查询使用主模型（如 Claude Opus）
+- 通过在 `cli-config.yaml` 中配置 `smart_model_routing.enabled: true` 启用
+- 可自定义 `max_simple_chars`、`max_simple_words`、`cheap_model` 等参数
+
 ---
 
-## 十、学习路径建议
+## 十六、学习路径建议
 
 1. `hermes_cli/commands.py` -- 命令系统心智模型
 2. `hermes_cli/skin_engine.py` -- 数据驱动设计

@@ -11,10 +11,10 @@
 Hermes Agent 在此代码库中实现了两种协议的完整集成：
 
 **MCP (Model Context Protocol)** -- 两个角色：
-- **MCP 客户端** (`tools/mcp_tool.py`, ~2274 行)：连接外部 MCP 服务器，发现其工具并注册到本地工具注册表，让 Hermes Agent 可以像调用内置工具一样调用远程 MCP 服务器暴露的工具。
-- **MCP 服务器** (`mcp_serve.py`, ~868 行)：将 Hermes 的消息对话能力（跨 Telegram、Discord、Slack 等平台）暴露为 MCP 工具，使任何 MCP 客户端（Claude Code、Cursor、Codex 等）可以读取对话、发送消息、轮询事件。
+- **MCP 客户端** (`tools/mcp_tool.py`, ~2273 行)：连接外部 MCP 服务器，发现其工具并注册到本地工具注册表，让 Hermes Agent 可以像调用内置工具一样调用远程 MCP 服务器暴露的工具。
+- **MCP 服务器** (`mcp_serve.py`, ~867 行)：将 Hermes 的消息对话能力（跨 Telegram、Discord、Slack 等平台）暴露为 MCP 工具，使任何 MCP 客户端（Claude Code、Cursor、Codex 等）可以读取对话、发送消息、轮询事件。
 
-**ACP (Agent Client Protocol)** -- 适配器 (`acp_adapter/`, ~7 个文件)：将 Hermes Agent 的完整对话能力通过 ACP 协议暴露给编辑器客户端（如 VS Code 的 AI 插件），支持会话管理、实时事件流、权限审批和斜杠命令。
+**ACP (Agent Client Protocol)** -- 适配器 (`acp_adapter/`, ~9 个文件)：将 Hermes Agent 的完整对话能力通过 ACP 协议暴露给编辑器客户端（如 VS Code 的 AI 插件），支持会话管理、实时事件流、权限审批和斜杠命令。
 
 ### 1.2 架构总览
 
@@ -41,6 +41,26 @@ Hermes Agent 在此代码库中实现了两种协议的完整集成：
     │ 服务器     │    │(Claude Code)│         │  (编辑器)   │
     └───────────┘    └─────────────┘         └─────────────┘
 ```
+
+### 1.3 源文件清单
+
+| 文件 | 行数 | 角色 | 关键类/函数 |
+|------|------|------|------------|
+| `tools/mcp_tool.py` | 2273 | MCP 客户端核心 | `MCPServerTask`, `SamplingHandler`, `_make_tool_handler()` |
+| `mcp_serve.py` | 867 | MCP 服务器核心 | `EventBridge`, FastMCP 工具定义 |
+| `tools/mcp_oauth.py` | 482 | MCP OAuth 2.1 支持 | `build_oauth_auth()`, `HermesTokenStorage` |
+| `model_tools.py` | 562 | 工具定义转换 | `get_tool_definitions()`, 工具集过滤 |
+| `acp_adapter/__init__.py` | 1 | 包标记 | — |
+| `acp_adapter/__main__.py` | 5 | CLI 入口桥接 | — |
+| `acp_adapter/auth.py` | 24 | 认证提供商检测 | `detect_provider()` |
+| `acp_adapter/entry.py` | 85 | ACP 启动入口 | `main()`, `_setup_logging()`, `_load_env()` |
+| `acp_adapter/events.py` | 175 | ACP 事件桥接 | `make_tool_progress_cb()`, `make_thinking_cb()`, `make_step_cb()`, `make_message_cb()` |
+| `acp_adapter/permissions.py` | 77 | 权限审批桥接 | `make_approval_callback()` |
+| `acp_adapter/server.py` | 728 | ACP Agent 主体实现 | `HermesACPAgent` |
+| `acp_adapter/session.py` | 475 | 会话持久化管理 | `SessionManager`, `SessionState` |
+| `acp_adapter/tools.py` | 214 | 工具类型映射与事件构建 | `build_tool_start()`, `build_tool_complete()` |
+| `acp_registry/agent.json` | — | ACP 客户端自动发现清单 | agent 元数据声明 |
+| `acp_registry/icon.svg` | — | Agent 图标 | — |
 
 ---
 
@@ -72,6 +92,37 @@ Hermes 的 MCP 客户端实现了完整的四层支持，并且为 Resources 和
 - 支持 OAuth 2.1 PKCE 认证
 - 兼容新旧两版 SDK API：`_MCP_NEW_HTTP` 标志控制使用 `streamable_http_client` 还是 `streamablehttp_client`
 - 传输选择逻辑在 `_is_http()`：通过配置中是否有 `url` 字段判断
+
+**OAuth 2.1 PKCE 认证**：
+
+当 MCP 服务器要求 OAuth 认证（配置 `auth: oauth`），`mcp_tool.py` 会调用 `tools/mcp_oauth.py` 的 `build_oauth_auth()` 函数构建认证处理器：
+
+```python
+from tools.mcp_oauth import build_oauth_auth
+_oauth_auth = build_oauth_auth(server_name, url, config.get("oauth"))
+```
+
+`build_oauth_auth()` 返回 `mcp.client.auth.OAuthClientProvider` 实例（一个 `httpx.Auth` 子类），该实例被直接注入到 `httpx.AsyncClient` 的 `auth` 参数中，MCP SDK 底层自动处理 discovery、dynamic client registration、PKCE、token exchange、refresh 和 step-up authorization。Hermes 侧提供的关键组件：
+
+- **HermesTokenStorage**：将 OAuth token 和 client 注册信息持久化到 `HERMES_HOME/mcp-tokens/` 目录（`.json` 存储 token，`.client.json` 存储 client info），支持进程重启后复用 token。文件权限 `0o600` 防止凭据泄露。
+- **本地回调服务器**：在 `127.0.0.1` 随机端口启动临时 HTTP 服务器，接收 OAuth 授权码回调（`redirect_uri: http://127.0.0.1:{port}/callback`）。
+- **浏览器交互**：自动检测交互式环境（`sys.stdin.isatty()`）和浏览器可用性（`SSH_CLIENT`、`DISPLAY` 等），自动打开浏览器跳转授权页面；headless 环境下打印 URL 供手动访问。
+- **自动刷新**：`OAuthClientProvider` 内置 token 刷新逻辑，token 过期时自动通过 `refresh_token` 续期，对上层完全透明。
+
+配置示例：
+```yaml
+mcp_servers:
+  my_server:
+    url: "https://mcp.example.com/mcp"
+    auth: oauth
+    oauth:
+      client_id: "pre-registered-id"   # 可选，跳过动态注册
+      scope: "read write"              # 可选，默认使用服务器提供的 scope
+      redirect_port: 0                 # 0 = 自动选择空闲端口
+      client_name: "My Custom Client"  # 默认 "Hermes Agent"
+```
+
+非交互环境下的行为：如果没有缓存的 token 且无法打开浏览器，`build_oauth_auth()` 会记录警告但不抛异常——MCP 连接会因缺少认证而失败，但不会阻塞其他服务器的连接。
 
 **选择决策树**：
 ```
@@ -145,6 +196,26 @@ registry.register(
 ```
 
 **工具名称转换**：MCP 工具名 `read_file` 在服务器 `filesystem` 上注册为 `mcp_filesystem_read_file`。通过 `sanitize_mcp_name_component()` 确保名称安全。
+
+**命名约定详解 (`sanitize_mcp_name_component()`)**：
+
+```python
+def sanitize_mcp_name_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
+```
+
+该函数用 `_` 替换所有非 `[A-Za-z0-9_]` 的字符。具体行为：
+
+| 输入 | 输出 | 说明 |
+|------|------|------|
+| `"my-server"` | `"my_server"` | 连字符转下划线（历史行为） |
+| `"hello.world"` | `"hello_world"` | 点号转下划线 |
+| `""` | `""` | 空字符串保持空 |
+| `"spaced name"` | `"spaced_name"` | 空格转下划线 |
+| `"中文"` | `"__"` | 非 ASCII 字符全部替换 |
+| `"tool@v1"` | `"tool_v1"` | 特殊字符替换 |
+
+此函数同时用于 server name 和 tool name 的清洗，确保生成的工具名 `mcp_{server}_{tool}` 完全兼容 OpenAI function-calling 的命名规则（仅允许 `[A-Za-z0-9_-]`，最长 64 字符）。注意：MCP SDK 的命名规范与 OpenAI 规范略有差异（MCP 允许 `.` 而 OpenAI 不允许），`sanitize_mcp_name_component()` 的输出同时满足两者的最严格约束。
 
 **工具调用代理** (`_make_tool_handler`)：
 ```python
@@ -229,7 +300,96 @@ mcp_servers:
 - `include` 优先于 `exclude`
 - 与内置工具的名称冲突检测：MCP 工具不会覆盖内置工具
 
-### 2.5 自动重连与错误恢复
+**完整 MCP 工具调用链路追踪**：
+
+以下是一次完整的 MCP 工具调用从 Agent 决策到获取结果的全过程：
+
+```
+步骤 1: Agent LLM 返回 tool_call
+    AIAgent.run_conversation()  →  LLM 返回: {"name": "mcp_fs_read_file", "arguments": "{\"path\": \"/tmp/foo.txt\"}"}
+
+步骤 2: 工具解析与匹配
+    ToolRegistry 查找 "mcp_fs_read_file"  →  找到 handler (由 _make_tool_handler 生成的闭包)
+
+步骤 3: 同步 handler 调用 (Agent 工作线程)
+    _handler({"path": "/tmp/foo.txt"})
+      → 从 _servers 获取 server 实例 (线程安全，通过 _lock)
+      → 检查 server.session 是否存活
+      → 构造异步协程 _call()
+
+步骤 4: 线程桥接 (_run_on_mcp_loop)
+    asyncio.run_coroutine_threadsafe(_call(), _mcp_loop)
+      → 将协程调度到 MCP 专用事件循环
+      → while True: 轮询 future.result(timeout=0.1)
+        → 每次轮询检查 is_interrupted() 支持用户中断
+      → 得到结果或超时
+
+步骤 5: MCP JSON-RPC 调用 (MCP 事件循环)
+    server.session.call_tool("read_file", {"path": "/tmp/foo.txt"})
+      → MCP SDK 构造 JSON-RPC 请求:
+         {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "read_file", "arguments": {"path": "/tmp/foo.txt"}}, "id": 42}
+      → 通过 stdio 管道或 HTTP POST 发送给 MCP 服务器
+
+步骤 6: MCP 服务器处理并响应
+    MCP 服务器收到请求 → 执行 read_file → 返回:
+    {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": "Hello World\n"}], "isError": false}, "id": 42}
+
+步骤 7: SDK 解析响应
+    MCP SDK 解析为 CallToolResult 对象:
+      .content = [TextContent(text="Hello World\n")]
+      .isError = False
+
+步骤 8: _call() 协程处理结果
+    → 检查 result.isError → False，跳过错误处理
+    → 遍历 result.content blocks，提取 .text 字段 → "Hello World\n"
+    → 检查 result.structuredContent → None，跳过
+    → 返回: '{"result": "Hello World\\n"}'
+
+步骤 9: _handler 返回
+    → _run_on_mcp_loop 返回 JSON 字符串给 Agent 工作线程
+    → _handler 返回最终结果
+
+步骤 10: Agent 消费结果
+    Agent 将工具结果追加到对话历史 → 继续下一轮 LLM 调用
+```
+
+时间预算（典型场景）：
+- 步骤 1-3: <1ms (同步代码)
+- 步骤 4 (轮询开销): 0-100ms (取决于协程何时完成)
+- 步骤 5-6 (网络/管道往返): 1-50ms (本地 stdio) / 10-500ms (远程 HTTP)
+- 步骤 7-9: <1ms (同步代码)
+- 总延迟: 1-600ms
+
+### 2.5 工具注册表集成点 (`model_tools.get_tool_definitions()`)
+
+`model_tools.py` 的 `get_tool_definitions()` 是 MCP 工具与 Hermes Agent 之间的**关键缝合点**。该函数负责：
+
+1. **工具集过滤**：根据 `enabled_toolsets`（白名单）和 `disabled_toolsets`（黑名单）筛选工具。
+2. **格式转换**：将 ToolRegistry 中的内部工具定义转换为 OpenAI 兼容的 function-calling 格式：
+   ```json
+   {
+     "type": "function",
+     "function": {
+       "name": "mcp_fs_read_file",
+       "description": "Read the complete contents of a file...",
+       "parameters": { "type": "object", "properties": { ... } }
+     }
+   }
+   ```
+3. **动态刷新**：当 MCP 工具通过 `_refresh_tools()` 更新后，如果 Agent 缓存了旧的工具列表，需要调用 `_invalidate_system_prompt()` 使其在下一次调用 `get_tool_definitions()` 时重新获取。
+
+调用链：
+```
+AIAgent.run_conversation()
+  → get_tool_definitions(enabled_toolsets=["mcp-filesystem", "hermes-core"])
+    → registry.get_definitions_for_toolset("mcp-filesystem")  # 返回 OpenAI 格式
+    → registry.get_definitions_for_toolset("hermes-core")
+  → 合并后传给 LLM API 的 tools 参数
+```
+
+这意味着 MCP 工具对 Agent 完全透明——Agent 的 LLM 调用层面不区分本地工具和远程 MCP 工具，所有工具统一通过 OpenAI function-calling 机制暴露。在 ACP 场景中，`server.py` 在注册新 MCP 服务器后显式调用 `get_tool_definitions()` 刷新 agent 的工具面，后续 LLM 调用将自动包含新注册的工具。
+
+### 2.6 自动重连与错误恢复
 
 **指数退避重连**：
 
@@ -245,6 +405,18 @@ if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:  # 3
 await asyncio.sleep(backoff)
 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)  # 最大 60 秒
 ```
+
+**重连边界情况讨论**：
+
+MCP 服务器重启后工具列表可能发生变化（新增、移除、schema 变更）。当前设计存在以下边界情况：
+
+1. **重连后工具列表过期**：重连使用上次的 `list_tools()` 快照。如果服务器重启后提供了不同的工具集，客户端可能持有过期的工具列表，直到收到 `notifications/tools/list_changed` 通知（或手动重启 Hermes）。对于支持动态通知的 MCP 服务器，`_make_message_handler()` 会自动触发 `_refresh_tools()`；对于不支持的老服务器，工具列表会在下次 `register_mcp_servers()` 重新发现时更新。
+
+2. **正在进行的工具调用**：如果服务器在工具调用进行中断开，`call_tool()` 会抛出异常，handler 返回错误 JSON（`{"error": "MCP call failed: ..."}`）。Agent 可以根据错误信息决定重试或放弃。
+
+3. **重连期间的 shutdown**：`run()` 循环在退避等待期间检查 `_shutdown_requested` 标志，确保优雅关闭不会被无限推迟。
+
+4. **孤儿工具**：如果服务器彻底下线（超过最大重试次数），已注册的工具仍留在 ToolRegistry 中但标记为不可用（`_make_check_fn()` 的 `check_fn` 返回 False），Agent 调用时会返回 "not connected" 错误。
 
 **动态工具发现**：
 
@@ -326,7 +498,7 @@ async def _refresh_tools(self):
 **子进程管理**：
 通过 `_snapshot_child_pids()` 跟踪 stdio 子进程 PID，在事件循环关闭后强制杀死未正常退出的孤儿进程。
 
-### 2.6 Sampling 支持
+### 2.7 Sampling 支持
 
 `SamplingHandler` 实现了 MCP 的 `sampling/createMessage` 能力，允许 MCP 服务器反向请求 LLM 补全，这是 MCP 协议中最强大的特性之一：
 
@@ -453,7 +625,52 @@ async def __call__(self, context, params):
 - 超时控制（`timeout`，默认 30 秒）
 - 审计日志：记录所有采样请求和结果，便于安全审计
 
-### 2.7 安全机制
+### 2.8 MCP 连接初始化握手时序图
+
+```
+  Hermes (MCP Client)                     External MCP Server
+  ──────────────────                      ───────────────────
+        │                                         │
+        │  1. 启动子进程 / HTTP 连接               │
+        │─────────────────────────────────────────│
+        │                                         │
+        │  2. initialize                          │
+        │  {"method":"initialize",                │
+        │   "params":{"protocolVersion":"...",    │
+        │   "capabilities":{...},                 │
+        │   "clientInfo":{...}}}                  │
+        │─────────────────────────────────────────▶
+        │                                         │
+        │  3. initialize response                 │
+        │  {"result":{"protocolVersion":"...",    │
+        │   "capabilities":{"tools":{}},          │
+        │   "serverInfo":{...}}}                  │
+        │◀─────────────────────────────────────────│
+        │                                         │
+        │  4. initialized notification            │
+        │  {"method":"notifications/              │
+        │   initialized"}                         │
+        │─────────────────────────────────────────▶
+        │                                         │
+        │  5. tools/list                          │
+        │─────────────────────────────────────────▶
+        │  {"tools":[{name:"read_file", ...},     │
+        │   {name:"write_file", ...}]}            │
+        │◀─────────────────────────────────────────│
+        │                                         │
+        │  6. resources/list (可选)               │
+        │─────────────────────────────────────────▶
+        │◀─────────────────────────────────────────│
+        │                                         │
+        │  7. prompts/list (可选)                 │
+        │─────────────────────────────────────────▶
+        │◀─────────────────────────────────────────│
+        │                                         │
+        │  [tools → ToolRegistry.register()]      │
+        │  [Agent 获得工具列表]                    │
+```
+
+### 2.9 安全机制
 
 **环境变量过滤**：
 ```python
@@ -503,6 +720,8 @@ _MCP_INJECTION_PATTERNS = [
 | `channels_list` | 列出可用渠道 |
 | `permissions_list_open` | 列出待审批请求 |
 | `permissions_respond` | 响应审批请求 |
+
+**`events_wait` 安全限制**：`events_wait` 工具的 `timeout_ms` 参数被强制限制在 5 分钟（300000ms）以内——工具实现中通过 `timeout_ms = min(timeout_ms, 300000)` 进行上限约束。这防止了客户端设置过长超时（如几小时）导致 EventBridge 的 `wait_for_event()` 长期占用线程资源。客户端如果需要更长的等待，应使用 `events_poll` + 客户端侧循环的组合模式。
 
 ### 3.2 EventBridge 事件桥
 
@@ -622,6 +841,61 @@ def wait_for_event(
   - 唤醒机制：`threading.Event` 用于 `wait_for_event()` 的阻塞等待，减少 CPU 占用
 - **光标机制**：使用递增光标确保事件消费的可靠性，避免重复或丢失事件
 
+**EventBridge 轮询周期时序图**：
+
+```
+  MCP Client            mcp_serve.py          EventBridge Thread      SessionDB (SQLite)
+  ──────────            ────────────          ────────────────      ──────────────────
+       │                      │                       │                     │
+       │  events_wait(        │                       │                     │
+       │    after_cursor=5)   │                       │                     │
+       │─────────────────────▶│                       │                     │
+       │                      │  wait_for_event(      │                     │
+       │                      │    after_cursor=5,    │                     │
+       │                      │    timeout_ms=30000)  │                     │
+       │                      │──────────────────────▶│                     │
+       │                      │                       │                     │
+       │                      │                       │  ┌─────────────────┐│
+       │                      │                       │  │ _poll_loop 循环  ││
+       │                      │                       │  │ (每 200ms)      ││
+       │                      │                       │  └─────────────────┘│
+       │                      │                       │                     │
+       │                      │                       │  检查 mtime         │
+       │                      │                       │─────────────────────│
+       │                      │                       │◀─────────────────────│
+       │                      │                       │  (文件未变化，跳过)  │
+       │                      │                       │                     │
+       │                      │                       │  [用户发送新消息]    │
+       │                      │                       │                     │
+       │                      │                       │  检查 mtime         │
+       │                      │                       │─────────────────────│
+       │                      │                       │  mtime 已变化!      │
+       │                      │                       │◀─────────────────────│
+       │                      │                       │                     │
+       │                      │                       │  读取新消息         │
+       │                      │                       │─────────────────────│
+       │                      │                       │◀─────────────────────│
+       │                      │                       │                     │
+       │                      │                       │  queue.append(       │
+       │                      │                       │    QueueEvent(       │
+       │                      │                       │      cursor=6,       │
+       │                      │                       │      type="message"))│
+       │                      │                       │  _new_event.set()    │
+       │                      │                       │                     │
+       │                      │  wait_for_event()     │                     │
+       │                      │  _new_event 被唤醒!   │                     │
+       │                      │  return {cursor: 6,   │                     │
+       │                      │    type: "message",   │                     │
+       │                      │    ...}               │                     │
+       │                      │◀──────────────────────│                     │
+       │                      │                       │                     │
+       │  {"event": {         │                       │                     │
+       │    "cursor": 6,      │                       │                     │
+       │    "type": "message",│                       │                     │
+       │    ...}}             │                       │                     │
+       │◀─────────────────────│                       │                     │
+```
+
 ### 3.3 数据提取
 
 `_extract_message_content()` 和 `_extract_attachments()` 处理多平台消息格式：
@@ -642,7 +916,58 @@ ACP (Agent Client Protocol) 是一个面向编辑器集成的协议，允许 IDE
 - 权限审批流程
 - 模型/模式切换
 
-### 4.2 服务器实现 (`server.py`)
+### 4.2 ACP Agent 发现机制
+
+**ACP Registry** (`acp_registry/`) 是 ACP 协议的客户端自动发现机制，包含两个文件：
+
+- **`agent.json`** -- Agent 清单文件，声明 agent 的元数据和启动方式：
+
+```json
+{
+  "schema_version": 1,
+  "name": "hermes-agent",
+  "display_name": "Hermes Agent",
+  "description": "AI agent by Nous Research with 90+ tools, persistent memory, and multi-platform support",
+  "icon": "icon.svg",
+  "distribution": {
+    "type": "command",
+    "command": "hermes",
+    "args": ["acp"]
+  }
+}
+```
+
+- **`icon.svg`** -- Agent 图标（SVG 格式），在 ACP 客户端 UI 中展示
+
+**发现流程**：ACP 客户端（如 VS Code AI 插件）扫描系统路径中的 `agent.json` 文件，解析 `distribution` 字段获取启动命令。客户端通过 `hermes acp` 命令启动 agent 子进程，通过 stdio 建立 JSON-RPC 连接。这种方式解耦了 agent 的安装和发现：agent 只需将 `agent.json` 安装到标准 ACP registry 路径，客户端即可自动发现和启动，无需手动配置。
+
+### 4.3 ACP 服务器启动流程
+
+`acp_adapter/entry.py` 是 ACP 适配器的 CLI 入口（可通过 `hermes acp` 或 `python -m acp_adapter.entry` 启动），包含三阶段启动流程：
+
+```python
+def main() -> None:
+    _setup_logging()     # 1. 日志重定向到 stderr
+    _load_env()          # 2. 加载 ~/.hermes/.env 环境变量
+    
+    import acp
+    from .server import HermesACPAgent
+    
+    agent = HermesACPAgent()
+    asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
+```
+
+**启动流程详解**：
+
+1. **`_setup_logging()`**：将所有 logging 输出路由到 stderr，格式为 `2026-05-19 10:00:00 [INFO] hermes: ...`。同时静默 `httpx`、`httpcore`、`openai` 等第三方库的日志。这是 ACP 传输的关键要求——stdout 必须保持干净用于 JSON-RPC 双向协议帧，任何非 JSON-RPC 的数据流都会导致协议解析错误。
+
+2. **`_load_env()`**：从 `~/.hermes/.env` 文件加载环境变量（LLM API key 等）。使用 `hermes_cli.env_loader.load_hermes_dotenv()` 实现，支持多个 `.env` 文件合并。如果 `.env` 不存在则使用系统环境变量，不会抛错。
+
+3. **`acp.run_agent(agent, use_unstable_protocol=True)`**：启动 ACP agent 服务，阻塞直到 agent 退出。`use_unstable_protocol=True` 表示使用最新的 ACP 协议版本（可能包含尚未最终稳定的特性）。这是 Hermes 跟随 ACP 协议演进的策略：始终使用最新版本以获得最佳功能支持，同时承担协议变更的风险（需要在协议升级时跟进适配）。对应地，测试中也同样传入该参数以保持一致性。
+
+**路径设置**：`entry.py` 还会将项目根目录加入 `sys.path`（`str(Path(__file__).resolve().parent.parent)`），确保 `from run_agent import AIAgent` 等导入在从任意位置启动时都能正确解析。
+
+### 4.4 服务器实现 (`server.py`)
 
 `HermesACPAgent` 继承 `acp.Agent`，实现完整的 ACP 协议：
 
@@ -775,7 +1100,55 @@ approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
 
 **ACP MCP 服务器转发**：ACP 客户端可以在 `new_session`/`load_session`/`resume_session` 中传入 `mcp_servers` 列表，服务器自动调用 `register_mcp_servers()` 注册并刷新 Agent 的工具面。
 
-### 4.3 会话管理 (`session.py`)
+**ACP 会话生命周期时序图**：
+
+```
+  ACP Client (编辑器)                 HermesACPAgent                 SessionManager
+  ──────────────────                 ───────────────                ──────────────
+        │                                    │                            │
+        │  new_session                       │                            │
+        │  {cwd, model, mcp_servers}         │                            │
+        │───────────────────────────────────▶│                            │
+        │                                    │  _make_agent()             │
+        │                                    │───────────────────────────▶│
+        │                                    │  SessionState              │
+        │                                    │◀───────────────────────────│
+        │                                    │                            │
+        │                                    │  register_mcp_servers()    │
+        │                                    │  (if mcp_servers provided) │
+        │                                    │                            │
+        │  session response                  │                            │
+        │  {session_id, ...}                 │                            │
+        │◀───────────────────────────────────│                            │
+        │                                    │                            │
+        │  AvailableCommandsUpdate           │                            │
+        │  (slash commands)                  │                            │
+        │◀───────────────────────────────────│                            │
+        │                                    │                            │
+        │  prompt {session_id, message}      │                            │
+        │───────────────────────────────────▶│                            │
+        │                                    │  run_conversation()        │
+        │                                    │  (in thread pool)          │
+        │                                    │                            │
+        │  session_update events ...         │                            │
+        │  (tool progress, thinking,         │                            │
+        │   message chunks, ...)             │                            │
+        │◀─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                            │
+        │                                    │                            │
+        │                                    │  save_session()            │
+        │                                    │───────────────────────────▶│
+        │                                    │                            │
+        │  prompt response (complete)        │                            │
+        │◀───────────────────────────────────│                            │
+        │                                    │                            │
+        │  cancel {session_id}               │                            │
+        │───────────────────────────────────▶│                            │
+        │                                    │  cancel_event.set()        │
+        │                                    │  (Agent 线程收到中断)      │
+        │                                    │                            │
+```
+
+### 4.5 会话管理 (`session.py`)
 
 `SessionManager` 实现双层持久化：
 
@@ -808,7 +1181,7 @@ def get_session(self, session_id):
 - 创建 `AIAgent` 实例并设置 `platform="acp"`, `enabled_toolsets=["hermes-acp"]`, `quiet_mode=True`
 - 将 `_print_fn` 重定向到 stderr，保持 stdout 用于 JSON-RPC
 
-### 4.4 事件系统 (`events.py`)
+### 4.6 事件系统 (`events.py`)
 
 四个回调工厂，将 AIAgent 事件桥接到 ACP 通知：
 
@@ -898,7 +1271,7 @@ def _send_update(conn, session_id, loop, update):
 
 **工具调用 ID 管理**：使用 FIFO 队列 (`Deque[str]`) 跟踪同名并行工具调用的 ID，确保 `tool.started` 和 `tool.completed` 正确配对。这种设计即使在多个同名工具并行调用的情况下也能正确匹配开始和完成事件，避免 UI 显示混乱。
 
-### 4.5 权限与认证
+### 4.7 权限与认证
 
 **认证** (`auth.py`)：检测 Hermes 配置的运行时 LLM 提供商（如 `openai`、`anthropic`、`openrouter`），在 `initialize` 响应中作为 `auth_methods` 广告。
 
@@ -919,7 +1292,7 @@ def make_approval_callback(request_permission_fn, loop, session_id, timeout=60.0
 
 将终端命令的审批请求转发到 ACP 客户端（编辑器），用户在编辑器 UI 中选择允许/拒绝，结果映射回 Hermes 的审批回调。
 
-### 4.6 工具映射 (`tools.py`)
+### 4.8 工具映射 (`tools.py`)
 
 **工具类型映射**：
 ```python
@@ -1075,6 +1448,48 @@ JSON-RPC 2.0 是轻量级远程过程调用协议：
 }
 ```
 
+**真实 MCP tools/call 请求/响应对**：
+
+以下是一对真实的 JSON-RPC 帧，展示 Hermes MCP 客户端调用 Git MCP 服务器查询 git status 的过程：
+
+请求 (Hermes → Git MCP Server, via stdio):
+```json
+{
+    "jsonrpc": "2.0",
+    "id": 42,
+    "method": "tools/call",
+    "params": {
+        "name": "git_status",
+        "arguments": {
+            "repo_path": "/home/user/my-project"
+        }
+    }
+}
+```
+
+响应 (Git MCP Server → Hermes, via stdio):
+```json
+{
+    "jsonrpc": "2.0",
+    "id": 42,
+    "result": {
+        "content": [
+            {
+                "type": "text",
+                "text": "Repository status for /home/user/my-project:\nOn branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean"
+            }
+        ],
+        "isError": false
+    }
+}
+```
+
+注意几个关键点：
+- `id` 字段用于请求-响应匹配（JSON-RPC 支持乱序响应，通过 id 关联）
+- `result.content` 是数组格式（MCP 支持多内容块，如文本+图片）
+- `result.isError` 区分正常结果和工具执行错误
+- stdio 传输中以换行符分隔 JSON 帧，每帧为一行紧凑 JSON
+
 MCP 和 ACP 都基于 JSON-RPC 2.0，MCP 在其上定义了 `initialize`、`tools/list`、`tools/call`、`resources/list`、`resources/read`、`prompts/list`、`prompts/get`、`sampling/createMessage` 等方法。
 
 ### 6.5 SSE（Server-Sent Events）的原理
@@ -1097,7 +1512,7 @@ data: {"event": "update", "data": "world"}
 - 自动重连：浏览器 `EventSource` API 内置重连
 - 文本格式：`data:` 前缀，双换行分隔事件
 
-**在 MCP 中**：StreamableHTTP 传输使用 SSE 流式传输 JSON-RPC 消息，实现双向通信（请求通过 HTTP POST，响应/通知通过 SSE 流）。
+**在 MCP 中的实现**：Hermes 并不直接实现 SSE 逻辑。MCP 的 StreamableHTTP 传输完全由 MCP Python SDK 的 `streamable_http_client`（新 API）或 `streamablehttp_client`（旧 API）提供。这些 SDK 函数内部使用 HTTP POST 发送 JSON-RPC 请求，通过 SSE 流接收服务器推送的响应和通知——实现了"请求走 POST，响应/通知走 SSE"的双向通信模式。Hermes 只需提供配置好的 `httpx.AsyncClient`（带 OAuth 认证或自定义 headers），SDK 负责所有 SSE 连接的建立、重连和消息解析。
 
 ### 6.6 WebSocket vs SSE vs 长轮询
 
